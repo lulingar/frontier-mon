@@ -28,46 +28,42 @@ import re
 import sys
 import time 
 
-squid_access_re = r"""^(?P<client_ip>\S+) (?P<user_ident>\S+) (?P<user_name>\S+) \[(?:\S+ \S+)\] "(?P<method>\S+) (?:[^/]+)[/]+(?P<server>[^/]+)/(?P<servlet>[^/]+)/(?P<query_name>[^/]+)[/?](?P<query>\S+) HTTP/(?P<proto_version>\S+)" (?P<code>\d+) (?P<size>\d+) (?P<req_status>[^: ]+):(?P<hierarchy_status>\S+) (?P<resp_time>\d+) "(?P<frontier_id>[^"]+)" "(?P<IMS>[^"]*)"$"""
-squid_regex = re.compile(squid_access_re)
-
 def main():
 
     try:
         for line in fileinput.input():
 
             record = parse_log_line (line)
-            if record is None: return 1
+            if not record: return 1
             
             if 'fid_userdn' in record:
-                print '%.6f' % record['timestamp'], '(%s)' % record['fid_userdn'], record['client_ip'], record['fid_sw_release'], record['size'], record['fid_uid'], '>', record['server'], record['query'], record['servlet']
+                print record['timestamp'], '(%s)' % record['fid_userdn'], record['client_ip'], record['fid_sw_release'], record['size'], record['fid_uid'], '>', record['server'], record['query'], record['servlet']
 
     except KeyboardInterrupt:
         return 0
 
 
+
+squid_access_re = r"""^(?P<client_ip>\S+) (?P<user_ident>\S+) (?P<user_name>\S+) \[(?:\S+ \S+)\] "(?P<method>\S+) (?:[^/]+)[/]+(?P<server>[^/]+)/(?P<servlet>[^/]+)/(?P<query_name>[^/]+)[/?](?P<query>\S+) HTTP/(?P<proto_version>\S+)" (?P<code>\d+) (?P<size>\d+) (?P<req_status>[^: ]+):(?P<hierarchy_status>\S+) (?P<resp_time>\d+) "(?P<frontier_id>[^"]+)" "(?P<IMS>[^"]*)"$"""
+squid_regex = re.compile(squid_access_re)
+
 def parse_log_line (line):
 
-    try:
-        record = squid_regex.match(line).groupdict()
+    record = squid_regex.match(line).groupdict()
 
-        record['timestamp'] = time.time()
+    record['timestamp'] = int (1e6 * time.time())
 
-        frontier_id_parts = record['frontier_id'].split()
-        record.pop('frontier_id')
+    frontier_id_parts = record['frontier_id'].split()
+    record.pop('frontier_id')
 
-        record['fid_sw_release'] = frontier_id_parts[0]
-        record['fid_sw_version'] = frontier_id_parts[1]
+    record['fid_sw_release'] = frontier_id_parts[0]
+    record['fid_sw_version'] = frontier_id_parts[1]
 
-        if len(frontier_id_parts) > 2:
-            record['fid_pid'] = frontier_id_parts[2]
-        if len(frontier_id_parts) > 3:
-            record['fid_uid'] = frontier_id_parts[3]
-            record['fid_userdn'] = ' '.join(frontier_id_parts[4:])
-
-    except Exception:
-        print "\nLogException:",  line
-        return None
+    if len(frontier_id_parts) > 2:
+        record['fid_pid'] = frontier_id_parts[2]
+    if len(frontier_id_parts) > 3:
+        record['fid_uid'] = frontier_id_parts[3]
+        record['fid_userdn'] = ' '.join(frontier_id_parts[4:])
     
     return record
 
