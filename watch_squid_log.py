@@ -26,21 +26,65 @@
 import fileinput
 import re
 import sys
-import time 
+import threading
+import time
 
-def main():
+from Utils import current_utc_time_usecs, TimeWindowedRecord
+
+user_stats = TimeWindowedRecord (60)
+query_stats = TimeWindowedRecord (60)
+
+def main ():
+
+    threads_signal = threading.Event()
+
+    threads = [threading.Thread (name='log', target=log_thread, args=(threads_signal,)),
+               threading.Thread (name='print', target=print_thread, args=(threads_signal,))]
+
+    for thread in threads: thread.start()
 
     try:
-        for line in fileinput.input():
+        while True: time.sleep(100)
+    except (KeyboardInterrupt, SystemExit):
+        print "Exitting...",
+        threads_signal.set()
+        for thread in threads: thread.join()
+        print "success!"
 
-            record = parse_log_line (line)
-            if not record: return 1
-            
-            if 'fid_userdn' in record:
-                print record['timestamp'], '(%s)' % record['fid_userdn'], record['client_ip'], record['fid_sw_release'], record['size'], record['fid_uid'], '>', record['server'], record['query'], record['servlet']
+    return 0
 
-    except KeyboardInterrupt:
-        return 0
+
+def log_thread (signal):
+
+    for line in fileinput.input():
+
+        record = parse_log_line (line)
+        
+        if 'fid_userdn' in record:
+
+            user_stats.event (record['fid_userdn'])
+            query_stats.event ("%s#%s" % (record['servlet'], record['query']))
+
+        if signal.isSet():
+            break
+
+def print_thread (signal):
+    
+    while not signal.isSet():
+        signal.wait(2)
+
+        print chr(27) + "[2J"
+        print "At", time.strftime("%d/%b/%Y %H:%M:%S"), "for the last %.2f seconds:" % (query_stats.current_window_length_secs())
+
+        print "Query stats:" 
+        for query, amount in query_stats.most_frequent(10):
+            print "  -> (%d): %s" % (amount, query)
+
+        print "User stats:"
+        for user, amount in user_stats.most_frequent(10):
+            print "  -> (%d): %s" % (amount, user)
+
+        #print record['timestamp'], '(%s)' % record['fid_userdn'], record['client_ip'], record['fid_sw_release'], record['size'], record['fid_uid'], '>', record['server'], record['query'], record['servlet']
 
 
 
@@ -51,7 +95,7 @@ def parse_log_line (line):
 
     record = squid_regex.match(line).groupdict()
 
-    record['timestamp'] = int (1e6 * time.time())
+    record['timestamp'] = current_utc_time_usecs()
 
     frontier_id_parts = record['frontier_id'].split()
     record.pop('frontier_id')
@@ -66,6 +110,7 @@ def parse_log_line (line):
         record['fid_userdn'] = ' '.join(frontier_id_parts[4:])
     
     return record
+
 
 if __name__ == '__main__':
     sys.exit(main())
