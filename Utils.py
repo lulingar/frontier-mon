@@ -9,7 +9,11 @@ from operator import itemgetter
 def current_utc_time_usecs():
     return int (1e6 * time.time())
 
-class TimeWindowedRecord:
+def parse_utc_time_usecs (timestamp):
+    usecs = int (1e6 * time.mktime (time.strptime (timestamp, "%m/%d/%y %H:%M:%S.%f")))
+    return usecs
+
+class TimeWindowedRecord(object):
 
     def __init__ (self, window_length_secs, now=None):
 
@@ -39,7 +43,6 @@ class TimeWindowedRecord:
             interval_out, object_out = self.history_H.popleft()
             self.interval_sum_L -= interval_out
             self.access_counter[object_out] -= 1
-            #self.access_counter += collections.Counter()
 
         self.history_H.append (event)
 
