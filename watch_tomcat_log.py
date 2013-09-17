@@ -1,11 +1,11 @@
 import fileinput
-import json
 import sys
 import os
 import threading
 import time
 
-from Utils import current_utc_time_usecs, parse_utc_time_usecs, TomcatWatcher
+from Utils import TomcatWatcher, decode_frontier, get_hostname 
+
 
 tw = TomcatWatcher(10, True)
 
@@ -39,11 +39,6 @@ def print_thread (signal):
     while not signal.is_set():
 
         lines = ["At %s for the last %.2f seconds:" % ( time.strftime("%d/%b/%Y %H:%M:%S"), tw.current_window_length_secs() )]
-        """
-        lines.append('%d' % len(tw.history_H))
-        for id, record in tw.data_D.items():
-            lines.append('%s' % json.dumps(record, indent=2))
-        """
         rankings = tw.statistics.get_ranks(10) 
 
         for stat_id, ranking in rankings.items():
@@ -57,10 +52,11 @@ def print_thread (signal):
         print chr(27) + "[2J"
         print out_text
 
+        """
         fout = open (os.path.expanduser('~/www/test.txt'), 'w')
         fout.write (out_text)
         fout.close()
-
+        """
         signal.wait(1)
             
 

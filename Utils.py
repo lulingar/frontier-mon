@@ -1,3 +1,4 @@
+import base64
 import collections
 import functools
 import json
@@ -7,56 +8,16 @@ import time
 
 from heapq import nsmallest
 from operator import itemgetter
+from string import maketrans
+
 
 def current_utc_time_usecs():
     return int (1e6 * time.time())
 
+
 def parse_utc_time_usecs (timestamp):
     usecs = int (1e6 * time.mktime (time.strptime (timestamp, "%m/%d/%y %H:%M:%S.%f")))
     return usecs
-
-class TimeWindowedRecord(object):
-
-    def __init__ (self, window_length_secs, now=None):
-
-        self.window_length_V = int (window_length_secs*1e6)
-        self.history_H = collections.deque() 
-        self.interval_sum_L = 0
-
-        self.access_counter = collections.Counter()
-
-        if not now:
-            now = current_utc_time_usecs()
-        self.last_time = now 
-
-    def event (self, in_object, now=None):
-
-        if not now:
-            now = current_utc_time_usecs()
-        interval = now - self.last_time
-        self.last_time = now
-
-        event = [interval, in_object]
-        self.access_counter[in_object] += 1
-
-        self.interval_sum_L += interval
-
-        while self.interval_sum_L > self.window_length_V and self.history_H:
-            interval_out, object_out = self.history_H.popleft()
-            self.interval_sum_L -= interval_out
-            self.access_counter[object_out] -= 1
-
-        self.history_H.append (event)
-
-    def current_window_length_secs (self):
-        return self.interval_sum_L*1e-6
-
-    def most_frequent (self, ranks):
-        return self.access_counter.most_common (ranks)
-
-    def serialize (self):
-        return json.dumps ({'window': self.window_length_V,
-                           'history': list(self.history_H)})
 
 
 def lru_cache (maxsize=128):
@@ -92,6 +53,7 @@ def lru_cache (maxsize=128):
         return wrapper
 
     return decorating_function
+
 
 def lfu_cache (maxsize=128):
     '''Least-frequenty-used cache decorator.
@@ -144,6 +106,83 @@ def lfu_cache (maxsize=128):
         return wrapper
 
     return decorating_function
+
+
+class TimeWindowedRecord(object):
+
+    def __init__ (self, window_length_secs, now=None):
+
+        self.window_length_V = int (window_length_secs*1e6)
+        self.history_H = collections.deque() 
+        self.interval_sum_L = 0
+
+        self.access_counter = collections.Counter()
+
+        if not now:
+            now = current_utc_time_usecs()
+        self.last_time = now 
+
+    def event (self, in_object, now=None):
+
+        if not now:
+            now = current_utc_time_usecs()
+        interval = now - self.last_time
+        self.last_time = now
+
+        event = [interval, in_object]
+        self.access_counter[in_object] += 1
+
+        self.interval_sum_L += interval
+
+        while self.interval_sum_L > self.window_length_V and self.history_H:
+            interval_out, object_out = self.history_H.popleft()
+            self.interval_sum_L -= interval_out
+            self.access_counter[object_out] -= 1
+
+        self.history_H.append (event)
+
+    def current_window_length_secs (self):
+        return self.interval_sum_L*1e-6
+
+    def most_frequent (self, ranks):
+        return self.access_counter.most_common (ranks)
+
+    def serialize (self):
+        return json.dumps ({'window': self.window_length_V,
+                           'history': list(self.history_H)})
+
+
+@lfu_cache(maxsize=128)
+def get_hostname (ip):
+
+    try:
+        return socket.gethostbyaddr(ip)[0]
+
+    except socket.herror:
+        return 'unknown host'
+
+@lfu_cache(maxsize=128)
+def decode_frontier (query):
+    
+    char_translation = maketrans(".-_", "+/=")
+    url_parts = query.split ("encoding=BLOBzip5")
+
+    if len(url_parts) > 1:
+
+        url = url_parts[1].split("&p1=", 1)
+        encparts = url[1].split("&", 1)
+        if len(encparts) > 1:
+            ttlpart = "&" + encparts[1]
+        else:
+            ttlpart = ""
+        encoded_query = encparts[0].translate(char_translation)
+        decoded_query = zlib.decompress (base64.binascii.a2b_base64 (encoded_query)).strip()
+
+    else:
+        decoded_query = query
+
+    return decoded_query
+
 
 
 """

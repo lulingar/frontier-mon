@@ -1,16 +1,11 @@
-import base64
 import fileinput
 import os
 import re
-import socket
 import sys
 import threading
 import time
-import zlib
 
-from string import maketrans
-
-from Utils import current_utc_time_usecs, TimeWindowedRecord, lru_cache, lfu_cache
+from Utils import current_utc_time_usecs, TimeWindowedRecord, decode_frontier, get_hostname 
 
 user_stats = TimeWindowedRecord (60)
 query_stats = TimeWindowedRecord (60)
@@ -125,36 +120,6 @@ def parse_log_line (line):
     
     return record
 
-@lfu_cache(maxsize=64)
-def get_hostname (ip):
-
-    try:
-        return socket.gethostbyaddr(ip)[0]
-
-    except socket.herror:
-        return 'unknown host'
-
-@lfu_cache(maxsize=64)
-def decode_frontier (query):
-    
-    char_translation = maketrans(".-_", "+/=")
-    url_parts = query.split ("encoding=BLOBzip5")
-
-    if len(url_parts) > 1:
-
-        url = url_parts[1].split("&p1=", 1)
-        encparts = url[1].split("&", 1)
-        if len(encparts) > 1:
-            ttlpart = "&" + encparts[1]
-        else:
-            ttlpart = ""
-        encoded_query = encparts[0].translate(char_translation)
-        decoded_query = zlib.decompress (base64.binascii.a2b_base64 (encoded_query)).strip()
-
-    else:
-        decoded_query = query
-
-    return decoded_query
 
 if __name__ == '__main__':
     sys.exit(main())
