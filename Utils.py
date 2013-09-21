@@ -1,8 +1,10 @@
 import base64
+import copy
 import collections
 import functools
 import json
-import re
+import numpy as np
+import os
 import sys
 import time
 
@@ -10,15 +12,15 @@ from heapq import nsmallest
 from operator import itemgetter
 from string import maketrans
 
+# Remove buffering from stdout
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
 
 def current_utc_time_usecs():
     return int (1e6 * time.time())
 
-
 def parse_utc_time_usecs (timestamp):
     usecs = int (1e6 * time.mktime (time.strptime (timestamp, "%m/%d/%y %H:%M:%S.%f")))
     return usecs
-
 
 def lru_cache (maxsize=128):
     '''Least-recently-used cache decorator.
@@ -53,7 +55,6 @@ def lru_cache (maxsize=128):
         return wrapper
 
     return decorating_function
-
 
 def lfu_cache (maxsize=128):
     '''Least-frequenty-used cache decorator.
@@ -107,20 +108,19 @@ def lfu_cache (maxsize=128):
 
     return decorating_function
 
-
 class TimeWindowedRecord(object):
 
     def __init__ (self, window_length_secs, now=None):
 
         self.window_length_V = int (window_length_secs*1e6)
-        self.history_H = collections.deque() 
+        self.history_H = collections.deque()
         self.interval_sum_L = 0
 
         self.access_counter = collections.Counter()
 
         if not now:
             now = current_utc_time_usecs()
-        self.last_time = now 
+        self.last_time = now
 
     def event (self, in_object, now=None):
 
@@ -157,13 +157,12 @@ def get_hostname (ip):
 
     try:
         return socket.gethostbyaddr(ip)[0]
-
     except socket.herror:
         return 'unknown host'
 
 @lfu_cache(maxsize=128)
 def decode_frontier (query):
-    
+
     char_translation = maketrans(".-_", "+/=")
     url_parts = query.split ("encoding=BLOBzip5")
 
@@ -184,252 +183,215 @@ def decode_frontier (query):
     return decoded_query
 
 
+class IndexDict(collections.MutableMapping):
 
-"""
- Tomcat's access.log format is:
-    *  <servlet_name> <timestamp> id=<id> <payload>
-      Ex:
-         FrontierPrep 08/05/13 19:34:35.622 CEST +0200 id=293476 <payload> 
+    def __init__ (self, iterable=None):
 
- where the <payload> is composed of several kinds of messages:
-    *  servlet_version:<number> start threads:<number> <query_data> <client_data> <forwarding_data>
-      Ex:
-       servlet_version:3.30 start threads:1 query /type=frontier_request:1:DEFAULT&encoding=BLOBzip5&p1=<very_long_string_encoding_the_query> raddr 127.0.0.1 frontier-id: CMSSW_5_3_8_patch1 2.8.5 5258 puigh(524) Darren Puigh via: 1.0 vocms213.cern.ch:8000 (squid/frontier-squid-2.7.STABLE9-16.1) x-forwarded-for: 128.146.38.254
-    *  DB query finished msecs=<number>
-    *  rows=<number>, full size=<number>
-    *  DB connection released remaining=<number>
-    *  stop threads=<number> msecs=<number>
-    *  Error <error message>
-    *  Client disconnected while processing payload 0: ClientAbortException ... 
-    *  SQL <SQL query>
-    *  Acquiring DB connection [lock]
-    *  Executing DB query
-    *  [several others, to be ignored in the meantime]
-
-In any of these cases, the <id> can be appended with a "-ka", which means the connection was attempted to be Kept Alive.
-
-The other kind of entry is that of an exception. An example is:
-    java.lang.Exception: X-frontier-id header missing
-            at gov.fnal.frontier.Frontier.logClientDesc(Frontier.java:429)
-            at gov.fnal.frontier.Frontier.<init>(Frontier.java:261)
-            at gov.fnal.frontier.FrontierServlet.service(FrontierServlet.java:123)
-            at javax.servlet.http.HttpServlet.service(HttpServlet.java:723)
-            <several more of these lines>
-    <a blank line>
-"""
-
-class TomcatWatcher(object):
-
-    regex_general = re.compile(r'^(?P<servlet>\S+) (?P<timestamp>(?:\S+ ){4})id=(?P<id>\S+) (?P<payload>.*)')
-    regex_start = re.compile(r'servlet_version:(?P<version>\S+) start threads:(?P<threads_start>\d+) query (?P<query>\S+) raddr (?P<who>\S+) frontier-id: (?P<complement>.*)')
-    regex_dbacq = re.compile(r'DB connection acquired active=(?P<active_acq>\d+) msecs=(?P<msecs_acq>\d+)')
-    regex_dbfin = re.compile(r'DB query finished msecs=(?P<msecs_finish>\d+)')
-    regex_rowssize = re.compile(r'rows=(?P<rows>\d+), full size=(?P<size>\d+)')
-    regex_threads = re.compile(r'stop threads=(?P<threads_stop>\d+) msecs=(?P<msecs_stop>\d+)')
-    regex_error = re.compile(r'Error (?P<error>.*)')
-    regex_client = re.compile(r'Client (?P<client>.*)')
-    regex_sql = re.compile(r'SQL (?P<sql>.*)')
-    regex_acq = re.compile(r'Acquiring DB (?P<dbacq>.*)')
-    regex_exe = re.compile(r'Executing DB query')
-    regex_kaacq = re.compile(r'DB acquire sent keepalive (?P<kaacq>\d+)')
-
-    status_queued = 'queued'
-    status_exec = 'executing'
-    status_stop = 'finished'
-
-    finish_normal = 'ok'
-    finish_timeout = 'timed-out'
-    finish_error = 'aborted'
-
-    def __init__ (self, window_length_secs, use_timestamps_in_log=True):
-
-        self.use_timestamps_in_log = use_timestamps_in_log
-
-        self.window_length_V = int (1e6 * window_length_secs)
-        self.oldest_start_time = float("inf")
-        self.newest_stop_time = 0
-
-        self.history_H = collections.deque()
-        self.data_D = {}
-
-        self.last_id = None
-    
-        self.stats_list = (
-                {'filter': {'servlet':"FrontierProd"},
-                 'interest': 'query',
-                 'weighter': 'who',
-                 'action': 'tally'},
-                {'filter': {'servlet':"FrontierProd"},
-                 'interest': 'who',
-                 'weighter': 'size',
-                 'action': 'sum'},
-                {'filter': {'servlet':"smallfiles"},
-                 'interest': 'who',
-                 'weighter': 'size',
-                 'action': 'sum'}
-                )
-        self.statistics = RecordStatistics(self.stats_list)
-
-    def parse_log_line (self, line_in):
-
-        line = line_in.strip()
-        if not line: return
-
-        general_match = self.regex_general.match(line)
-
-        if general_match:
-            
-            record = general_match.groupdict()
-            id_raw = record.pop('id')
-            id = int (id_raw.replace('-ka', ''))
-
-            timestamp_log = record.pop('timestamp')
-            if self.use_timestamps_in_log:
-                timestamp = parse_utc_time_usecs (timestamp_log[:-12])
-            else:
-                timestamp = current_utc_time_usecs()
-
-            payload = record.pop('payload')
-           
-            match = self.regex_start.match(payload)
-            if match:
-                if self.oldest_start_time > timestamp: 
-                    self.oldest_start_time = timestamp
-
-                record.update (match.groupdict())
-                record['time_start'] = timestamp 
-                record['state'] = self.status_queued 
-                record['keepalives'] = 0
-
-                complement = record.pop('complement')
-                parts = complement.split(':')
-                record['fid'] = parts[0].replace(' x-forwarded-for', '').replace(' via', '')
-                if len(parts) > 1:
-                    if parts[-2].endswith(' x-forwarded-for'):
-                        record['forward'] = parts[-1]
-                    record['via'] = ':'.join(parts[1:-1]).replace('x-forwarded-for', '')
-
-                record['threads_start'] = int(record['threads_start'])
-                self.data_D[id] = record
-                self.history_H.append(id)
-                return
-           
-            if id in self.data_D:
-                record = self.data_D[id]
-                self.last_id = id
-            else:
-                return
-
-            match = self.regex_dbacq.match(payload)
-            if match:
-                record.update (match.groupdict())
-                record['active_acq'] = int(record['active_acq'])
-                record['msecs_acq'] = int(record['msecs_acq'])
-                return
-            
-            match = self.regex_dbfin.match(payload)
-            if match:
-                record.update (match.groupdict())
-                record['msecs_finish'] = int(record['msecs_finish'])
-                return
-            
-            match = self.regex_rowssize.match(payload)
-            if match:
-                record.update (match.groupdict())
-                record['rows'] = int(record['rows'])
-                record['size'] = int(record['size'])
-                return
-            
-            match = self.regex_threads.match(payload)
-            if match:
-                record.update (match.groupdict())
-                record['msecs_stop'] = int(record['msecs_stop'])
-                record['threads_stop'] = int(record['threads_stop'])
-                self.finish_record (id, timestamp, self.finish_normal)
-                return
-            
-            match = self.regex_error.match(payload)
-            if match:
-                if 'error' in record:
-                    print 'Existing error for id %s: %s' % (id, record['error'])
-                    print 'New error:', match.group('error')
-                return
-            
-            match = self.regex_client.match(payload)
-            if match:
-                if 'client_msg' not in record:
-                    record['client_msg'] = []
-                record['client_msg'].append (match.group('client'))
-                return
-            
-            match = self.regex_sql.match(payload)
-            if match:
-                record.update (match.groupdict())
-                return
-            
-            match = self.regex_acq.match(payload)
-            if match:
-                record.update (match.groupdict())
-                return
-            
-            match = self.regex_exe.match(payload)
-            if match:
-                record['state'] = self.status_exec
-                return
-            
-            match = self.regex_kaacq.match(payload)
-            if match:
-                record['keepalives'] += int(match.group('kaacq'))
-                return
-            
-            #print "No match!", line
-
+        if iterable:
+            self.odict = dict([(elem, i) for i, elem in enumerate(iterable)])
+            self.ilist = list(iterable)
         else:
-            if 'xception' in line:
-                if self.last_id:
-                    id = self.last_id
+            self.odict = {}
+            self.ilist = []
+
+        self._reusable_indices = set()
+
+    def add (self, item):
+        if len(self._reusable_indices) == 0:
+            index = len(self.ilist)
+        else:
+            index = min(self._reusable_indices)
+            self._reusable_indices.remove(index)
+            print "Reused index:", index
+
+        self.odict[item] = index
+
+        if len(self.ilist) > index:
+            self.ilist[index] = item
+        else:
+            self.ilist.append(item)
+        return index
+
+    def remove (self, item):
+        if item not in self.odict:
+            raise KeyError("%s is not in the dictionary" % str(item))
+        index = self.odict[item]
+        self.remove_by_index(index)
+
+    def remove_by_index (self, index):
+
+        if index >= len(self.ilist) or index < 0:
+            raise IndexError("Index out of range (%d)" % index)
+
+        if index == (len(self.ilist) - 1):
+            item = self.ilist.pop()
+        else:
+            self._reusable_indices.add(index)
+            item = self.ilist[index]
+            self.ilist[index] = None
+        del self.odict[item]
+
+    def __getitem__(self, item):
+        if item in self.odict:
+            return self.odict[item]
+        else:
+            return self.add(item)
+
+    def __setitem__(self, item, value):
+        pass
+
+    def __delitem__(self, item):
+        self.remove(item)
+
+    def __contains__(self, item):
+        return item in self.odict
+
+    def __len__(self):
+        return len(self.odict)
+
+    def __iter__(self):
+        return iter(self.ilist)
+
+    def iteritems(self):
+        return self.odict.iteritems()
+
+    def __repr__ (self):
+        elems = ', '.join(["%d:%s" % (i, repr(e)) for e, i in sorted(self.odict.iteritems(), key=lambda k: k[1])])
+        return "%s{%s}" % (self.__class__.__name__, elems)
+
+    def __call__(self, index):
+        if index >= len(self.ilist):
+            raise IndexError("Index %d out of range (%d)" % (index,
+                                                             len(self.ilist)))
+        return self.ilist[index]
+
+
+class RecordTable(object):
+
+    def __init__ (self, variables, initial_rows=128, datatype=np.float64):
+
+        assert isinstance(variables, dict), "Variables must be a dictionary of names-types pairs"
+
+        self._data_type = datatype
+        self._null_fill_value = np.nan
+        self._null_check_function = np.isnan
+        #self._null_check_function = lambda x: x == self._null_fill_value
+
+        self.column_table = IndexDict()
+        self.hash_table = {}
+        self.index_table = IndexDict()
+        self.data_table = np.empty( (initial_rows, len(variables)),
+                                    dtype = self._data_type )
+
+        self.data_table.fill (self._null_fill_value)
+        self._data_table_growth_factor = 0.3
+
+        for name, vartype in variables.items():
+            self.column_table.add (name)
+            if vartype not in (int, long, float):
+                self.hash_table[name] = IndexDict()
+
+    def render_record (self, key):
+
+        if key not in self.index_table:
+            raise KeyError("key %s does not exist in table" % str(key))
+
+        index = self.index_table[key]
+        data = self.data_table[index,:]
+
+        record = {'key': key}
+
+        for name, var_index in self.column_table.iteritems():
+            if name in self.hash_table:
+                hash_index = data[var_index]
+                if not self._null_check_function(hash_index):
+                    record[name] = self.hash_table[name](int(hash_index))
                 else:
-                    return
-
-                self.finish_record (id, timestamp, self.finish_error) 
-    
-            elif line.startswith('at '): 
-                return
-
+                    record[name] = self._null_fill_value
             else:
-                print "Unforseen line:", line
-        
+                record[name] = data[var_index]
 
-    def update (self):
-        
-        current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
-        while current_timespan_usecs > self.window_length_V:
-            dropped_id = self.history_H.popleft()
-            dropped_record = self.data_D.pop(dropped_id)
-            self.oldest_start_time = dropped_record['time_start']
-            current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
+        return record
 
-    def current_window_length_secs(self):
+    def insert (self, key, record):
 
-        current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
-        return current_timespan_usecs * 1e-6
+        if key in self.index_table:
+            raise KeyError("key %s already exists in table" % str(key))
 
-    def finish_record (self, id, timestamp, finish_mode):
+        added_row_index = self.index_table[key]
 
-        self.data_D[id]['time_stop'] = timestamp 
-        self.data_D[id]['state'] = self.status_stop
-        self.data_D[id]['finish_mode'] = finish_mode 
+        num_current_rows = len(self.index_table)
+        if num_current_rows >= self.data_table.shape[0]:
+            num_new_rows = int(self._data_table_growth_factor * num_current_rows)
+            new_rows = np.empty( (num_new_rows, len(self.column_table)),
+                                 dtype = self._data_type )
+            new_rows.fill (self._null_fill_value)
+            self.data_table = np.vstack ((self.data_table, new_rows))
+            print "Table enlarged to %d rows" % self.data_table.shape[0]
 
-        if self.newest_stop_time < timestamp: 
-            self.newest_stop_time = timestamp
+        for key, in_value in record.items():
 
+            if key not in self.column_table:
+                raise KeyError('Variable "%s" is not registered as a table column' % str(key))
+            if key in self.hash_table:
+                value = self.hash_table[key][in_value]
+            else:
+                value = in_value
 
-    def advance_records (self, line_in):
+            index = self.column_table[key]
+            self.data_table[added_row_index, index] = value
 
-        self.parse_log_line(line_in)
-        self.update()
-        self.statistics.get_statistics(self.data_D)
+    def modify (self, key, updates):
 
+        if key not in self.index_table:
+            raise KeyError("key %s does not exist in table" % str(key))
+
+        index = self.index_table[key]
+
+        for name, in_value in updates.items():
+            var_index = self.column_table[name]
+
+            if name in self.hash_table:
+                value = self.hash_table[name][in_value]
+            else:
+                value = in_value
+
+            self.data_table[index, var_index] = value
+
+    def remove (self, key):
+        assert key in self.index_table, "key %s does not exist in table" % str(key)
+        index = self.index_table[key]
+        self.index_table.remove_by_index(index)
+        self.data_table[index,:].fill (self._null_fill_value)
+
+    def pop (self, key):
+        record = self.render_record(key)
+        self.remove(key)
+        return record
+
+    def __delitem__(self, key):
+        self.remove(key)
+
+    def __setitem__(self, key, record):
+        self.insert (key, record)
+
+    def __call__(self, index):
+        if index >= len(self.index_table):
+            raise IndexError("This table currently has only %d rows" % len(self.index_table))
+        key = self.index_table(index)
+        return self.render_record(key)
+
+    def __contains__(self, key):
+        return key in self.index_table
+
+    def __len__(self):
+        return len(self.index_table)
+
+    def __getitem__(self, key):
+        return self.render_record(key)
+
+    #def __repr__(self):
+    #TODO: Pretty-print current table records
 
 class RecordStatistics(object):
 
@@ -454,7 +416,7 @@ class RecordStatistics(object):
                     filter_key, filter_val = stat_spec['filter'].items()[0]
                     if element[filter_key] != filter_val:
                         continue
-                
+
                 if interest in element:
 
                     interest_val = element[interest]
@@ -490,19 +452,19 @@ class RecordStatistics(object):
 
     #TODO: Replace statistics spec with a class that inherits from dict
     def gen_statistic_id (self, stat_spec):
-        
+
         interest = stat_spec['interest']
         weighter = stat_spec['weighter']
         action = stat_spec['action']
 
         if 'filter' in stat_spec:
-            pre_id = "{0}=={1} ".format(*stat_spec['filter'].items()[0])
+            pre_key = "{0}=={1} ".format(*stat_spec['filter'].items()[0])
         else:
-            pre_id = ''
+            pre_key = ''
 
-        id = "{0} {1} by {2}".format(action, interest, weighter)
+        key = "{0} {1} by {2}".format(action, interest, weighter)
 
-        return pre_id + id
+        return pre_key + key
 
 
 
@@ -531,7 +493,7 @@ if __name__ == "__main__":
             except KeyError:
                 print watch.history_H
                 print watch.object_table_T
-    
+
     threads_signal = threading.Event()
     t_f = threading.Thread (target=feed_events, name='feed', args=(threads_signal,))
     t_s = threading.Thread (target=show_window, name='show', args=(threads_signal,))

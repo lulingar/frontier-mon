@@ -4,10 +4,11 @@ import os
 import threading
 import time
 
-from Utils import TomcatWatcher, decode_frontier, get_hostname 
+from Utils import decode_frontier, get_hostname
+from TomcatLib import TomcatWatcher
 
 
-tw = TomcatWatcher(10, True)
+tw = TomcatWatcher(60, True)
 
 def main ():
 
@@ -35,21 +36,25 @@ def log_thread (signal):
 
 
 def print_thread (signal):
-   
+
     while not signal.is_set():
 
         lines = ["At %s for the last %.2f seconds:" % ( time.strftime("%d/%b/%Y %H:%M:%S"), tw.current_window_length_secs() )]
-        rankings = tw.statistics.get_ranks(10) 
+        """
+        rankings = tw.statistics.get_ranks(10)
 
         for stat_id, ranking in rankings.items():
             lines.append ('')
             lines.append (stat_id + ":")
             for rank, val in enumerate(ranking):
                 lines.append ("  -> (%d): %s" % (rank+1, val))
+        """
+        lines.append("tam: %d" % (len(tw)))
+        lines.append("data_D: %d" % (len(tw.data_D.index_table.ilist)))
 
         out_text = '\n'.join(lines)
 
-        print chr(27) + "[2J"
+        #print chr(27) + "[2J"
         print out_text
 
         """
@@ -58,7 +63,7 @@ def print_thread (signal):
         fout.close()
         """
         signal.wait(1)
-            
+
 
 if __name__ == "__main__":
     sys.exit(main())
