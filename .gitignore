@@ -1,1 +1,4 @@
-Utils.py
+*.pyc
+*.inp
+*.ou
+*.swp

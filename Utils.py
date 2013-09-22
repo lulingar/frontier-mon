@@ -4,6 +4,7 @@ import collections
 import functools
 import json
 import numpy as np
+import numpy.ma as ma
 import os
 import sys
 import time
@@ -202,7 +203,6 @@ class IndexDict(collections.MutableMapping):
         else:
             index = min(self._reusable_indices)
             self._reusable_indices.remove(index)
-            print "Reused index:", index
 
         self.odict[item] = index
 
@@ -273,45 +273,50 @@ class RecordTable(object):
         assert isinstance(variables, dict), "Variables must be a dictionary of names-types pairs"
 
         self._data_type = datatype
-        self._null_fill_value = np.nan
-        self._null_check_function = np.isnan
-        #self._null_check_function = lambda x: x == self._null_fill_value
+        self._data_table_growth_factor = 0.3
 
         self.column_table = IndexDict()
         self.hash_table = {}
         self.index_table = IndexDict()
-        self.data_table = np.empty( (initial_rows, len(variables)),
-                                    dtype = self._data_type )
-
-        self.data_table.fill (self._null_fill_value)
-        self._data_table_growth_factor = 0.3
+        self.data_table = ma.masked_all ((initial_rows, len(variables)),
+                                         dtype = self._data_type )
 
         for name, vartype in variables.items():
             self.column_table.add (name)
             if vartype not in (int, long, float):
                 self.hash_table[name] = IndexDict()
 
-    def render_record (self, key):
+    def get_row_variable (self, index, variable):
+
+        var_index = self.column_table[variable]
+
+        if variable in self.hash_table:
+            hash_index = self.data_table[index, var_index]
+            if ma.is_masked(hash_index):
+                value = None
+            else:
+                value = self.hash_table[variable](int(hash_index))
+        else:
+            value = self.data_table[index, var_index]
+
+        return value
+
+    def render_record (self, key, field=None):
 
         if key not in self.index_table:
             raise KeyError("key %s does not exist in table" % str(key))
 
         index = self.index_table[key]
-        data = self.data_table[index,:]
+        get_val = self.get_row_variable
+        if field:
+            return get_val (index, field)
 
-        record = {'key': key}
-
-        for name, var_index in self.column_table.iteritems():
-            if name in self.hash_table:
-                hash_index = data[var_index]
-                if not self._null_check_function(hash_index):
-                    record[name] = self.hash_table[name](int(hash_index))
-                else:
-                    record[name] = self._null_fill_value
-            else:
-                record[name] = data[var_index]
-
-        return record
+        else:
+            record = {'key': key}
+            for name in self.column_table:
+                value = get_val (index, name)
+                if value: record[name] = value
+            return record
 
     def insert (self, key, record):
 
@@ -323,10 +328,9 @@ class RecordTable(object):
         num_current_rows = len(self.index_table)
         if num_current_rows >= self.data_table.shape[0]:
             num_new_rows = int(self._data_table_growth_factor * num_current_rows)
-            new_rows = np.empty( (num_new_rows, len(self.column_table)),
-                                 dtype = self._data_type )
-            new_rows.fill (self._null_fill_value)
-            self.data_table = np.vstack ((self.data_table, new_rows))
+            new_rows = ma.masked_all( (num_new_rows, len(self.column_table)),
+                                      dtype = self._data_type )
+            self.data_table = ma.vstack ((self.data_table, new_rows))
             print "Table enlarged to %d rows" % self.data_table.shape[0]
 
         for key, in_value in record.items():
@@ -362,7 +366,7 @@ class RecordTable(object):
         assert key in self.index_table, "key %s does not exist in table" % str(key)
         index = self.index_table[key]
         self.index_table.remove_by_index(index)
-        self.data_table[index,:].fill (self._null_fill_value)
+        self.data_table[index,:] = ma.masked
 
     def pop (self, key):
         record = self.render_record(key)

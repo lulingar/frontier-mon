@@ -8,7 +8,7 @@ from Utils import decode_frontier, get_hostname
 from TomcatLib import TomcatWatcher
 
 
-tw = TomcatWatcher(60, True)
+tw = TomcatWatcher(5*60, True)
 
 def main ():
 
@@ -54,7 +54,7 @@ def print_thread (signal):
 
         out_text = '\n'.join(lines)
 
-        #print chr(27) + "[2J"
+        print chr(27) + "[2J"
         print out_text
 
         """
