@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 
-from Utils import current_utc_time_usecs, TimeWindowedRecord, decode_frontier, get_hostname 
+from Utils import current_utc_time_usecs, TimeWindowedRecord, decode_frontier, get_hostname
 
 user_stats = TimeWindowedRecord (60)
 query_stats = TimeWindowedRecord (60)
@@ -33,7 +33,7 @@ def log_thread (signal):
     for line in fileinput.input():
 
         record = parse_log_line (line)
-        
+
         if 'fid_userdn' in record:
 
             #user_stats.event ("%s#%s" % (record['client_ip'], record['fid_userdn']))
@@ -44,13 +44,13 @@ def log_thread (signal):
 
 
 def print_thread (signal):
-   
+
     while not signal.is_set():
 
         lines = ["At %s for the last %.2f seconds:" % ( time.strftime("%d/%b/%Y %H:%M:%S"), query_stats.current_window_length_secs() )]
 
         lines.append ('')
-        lines.append ("Query stats:") 
+        lines.append ("Query stats:")
         for query, amount in query_stats.most_frequent(10):
             lines.append ("  -> (%d): %s" % (amount, decode_frontier(query)))
 
@@ -58,7 +58,7 @@ def print_thread (signal):
         lines.append ("User stats:")
         for user, amount in user_stats.most_frequent(10):
             lines.append ("  -> (%d): %s" % (amount, get_hostname(user)))
-        
+
         out_text = '\n'.join(lines)
 
         fout = open (os.path.expanduser('~/www/test.txt'), 'w')
@@ -106,8 +106,7 @@ def parse_log_line (line):
 
     record['timestamp'] = current_utc_time_usecs()
 
-    frontier_id_parts = record['frontier_id'].split()
-    record.pop('frontier_id')
+    frontier_id_parts = record.pop('frontier_id').split()
 
     record['fid_sw_release'] = frontier_id_parts[0]
     record['fid_sw_version'] = frontier_id_parts[1]
@@ -117,7 +116,7 @@ def parse_log_line (line):
     if len(frontier_id_parts) > 3:
         record['fid_uid'] = frontier_id_parts[3]
         record['fid_userdn'] = ' '.join(frontier_id_parts[4:])
-    
+
     return record
 
 

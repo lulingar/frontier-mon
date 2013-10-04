@@ -6,8 +6,10 @@ import json
 import numpy as np
 import numpy.ma as ma
 import os
+import socket
 import sys
 import time
+import zlib
 
 from heapq import nsmallest
 from operator import itemgetter
@@ -153,19 +155,19 @@ class TimeWindowedRecord(object):
                            'history': list(self.history_H)})
 
 
-@lfu_cache(maxsize=128)
+@lfu_cache(maxsize=1024)
 def get_hostname (ip):
 
     try:
         return socket.gethostbyaddr(ip)[0]
     except socket.herror:
-        return 'unknown host'
+        return ip
 
-@lfu_cache(maxsize=128)
+@lfu_cache(maxsize=1024)
 def decode_frontier (query):
 
     char_translation = maketrans(".-_", "+/=")
-    url_parts = query.split ("encoding=BLOBzip5")
+    url_parts = query.split ("encoding=BLOB")
 
     if len(url_parts) > 1:
 
@@ -176,15 +178,18 @@ def decode_frontier (query):
         else:
             ttlpart = ""
         encoded_query = encparts[0].translate(char_translation)
-        decoded_query = zlib.decompress (base64.binascii.a2b_base64 (encoded_query)).strip()
-
+        try:
+            decoded_query = zlib.decompress (base64.binascii.a2b_base64 (encoded_query)).strip()
+        except zlib.error:
+            decoded_query = encoded_query
     else:
         decoded_query = query
 
     return decoded_query
 
 
-class IndexDict(collections.MutableMapping):
+class IndexDict(object):
+#class IndexDict(collections.MutableMapping):
 
     def __init__ (self, iterable=None):
 
@@ -198,7 +203,7 @@ class IndexDict(collections.MutableMapping):
         self._reusable_indices = set()
 
     def add (self, item):
-        if len(self._reusable_indices) == 0:
+        if not self._reusable_indices:
             index = len(self.ilist)
         else:
             index = min(self._reusable_indices)
@@ -223,12 +228,9 @@ class IndexDict(collections.MutableMapping):
         if index >= len(self.ilist) or index < 0:
             raise IndexError("Index out of range (%d)" % index)
 
-        if index == (len(self.ilist) - 1):
-            item = self.ilist.pop()
-        else:
-            self._reusable_indices.add(index)
-            item = self.ilist[index]
-            self.ilist[index] = None
+        self._reusable_indices.add(index)
+        item = self.ilist[index]
+        self.ilist[index] = None
         del self.odict[item]
 
     def __getitem__(self, item):
@@ -238,7 +240,8 @@ class IndexDict(collections.MutableMapping):
             return self.add(item)
 
     def __setitem__(self, item, value):
-        pass
+        # The rvalue "value" is silently ignored
+        self.add(item)
 
     def __delitem__(self, item):
         self.remove(item)
@@ -255,9 +258,16 @@ class IndexDict(collections.MutableMapping):
     def iteritems(self):
         return self.odict.iteritems()
 
+    def itervalues(self):
+        return self.odict.itervalues()
+
+    def values(self):
+        return sorted(self.odict.itervalues())
+
     def __repr__ (self):
-        elems = ', '.join(["%d:%s" % (i, repr(e)) for e, i in sorted(self.odict.iteritems(), key=lambda k: k[1])])
-        return "%s{%s}" % (self.__class__.__name__, elems)
+        elems = sorted (self.odict.iteritems(), key = lambda k: k[1])
+        elem_str = ', '.join(["%d:%s" % (i, repr(e)) for e, i in elems])
+        return "%s{%s}" % (self.__class__.__name__, elem_str)
 
     def __call__(self, index):
         if index >= len(self.ilist):
@@ -270,7 +280,8 @@ class RecordTable(object):
 
     def __init__ (self, variables, initial_rows=128, datatype=np.float64):
 
-        assert isinstance(variables, dict), "Variables must be a dictionary of names-types pairs"
+        if not isinstance(variables, dict):
+            raise KeyError("Variables must be a dictionary of names-types pairs")
 
         self._data_type = datatype
         self._data_table_growth_factor = 0.3
@@ -278,7 +289,7 @@ class RecordTable(object):
         self.column_table = IndexDict()
         self.hash_table = {}
         self.index_table = IndexDict()
-        self.data_table = ma.masked_all ((initial_rows, len(variables)),
+        self.data_table = ma.masked_all( (initial_rows, len(variables)),
                                          dtype = self._data_type )
 
         for name, vartype in variables.items():
@@ -317,6 +328,9 @@ class RecordTable(object):
                 value = get_val (index, name)
                 if value: record[name] = value
             return record
+
+    def get_raw_values (self):
+        return self.data_table[self.index_table.values(), :]
 
     def insert (self, key, record):
 
@@ -396,80 +410,6 @@ class RecordTable(object):
 
     #def __repr__(self):
     #TODO: Pretty-print current table records
-
-class RecordStatistics(object):
-
-    def __init__ (self, statistics_spec):
-
-        self.stats_dict = { self.gen_statistic_id(stat):stat for stat in statistics_spec }
-        self.stats_data = { self.gen_statistic_id(stat):{} for stat in statistics_spec }
-
-    def get_statistics (self, source_dict):
-
-        for stat_id, stat_spec in self.stats_dict.items():
-
-            statistic = self.stats_data[stat_id]
-
-            interest = stat_spec['interest']
-            weighter = stat_spec['weighter']
-            action = stat_spec['action']
-
-            for element in source_dict.itervalues():
-
-                if 'filter' in stat_spec:
-                    filter_key, filter_val = stat_spec['filter'].items()[0]
-                    if element[filter_key] != filter_val:
-                        continue
-
-                if interest in element:
-
-                    interest_val = element[interest]
-                    if weighter == 1:
-                        weighter_val = 1
-                    elif weighter in element:
-                        weighter_val = element[weighter]
-                    else:
-                        continue
-
-                    if interest_val not in statistic:
-                        statistic[interest_val] = collections.Counter()
-
-                    if action == 'tally':
-                        statistic[interest_val][weighter_val] += 1
-                    elif action == 'sum':
-                        statistic[interest_val]['sum'] += weighter_val
-
-
-    def get_ranks (self, num_ranks):
-
-        rankings = {}
-
-        for stat_id, stat_spec in self.stats_dict.items():
-            statistic = self.stats_data[stat_id]
-            try:
-                rankings[stat_id] = sorted (statistic.items(), key=lambda e: e[1].most_common(num_ranks), reverse=True)[:num_ranks]
-            except:
-                sys.stdout.write("!!!! %s\n" % (str(statistic)))
-
-
-        return rankings
-
-    #TODO: Replace statistics spec with a class that inherits from dict
-    def gen_statistic_id (self, stat_spec):
-
-        interest = stat_spec['interest']
-        weighter = stat_spec['weighter']
-        action = stat_spec['action']
-
-        if 'filter' in stat_spec:
-            pre_key = "{0}=={1} ".format(*stat_spec['filter'].items()[0])
-        else:
-            pre_key = ''
-
-        key = "{0} {1} by {2}".format(action, interest, weighter)
-
-        return pre_key + key
-
 
 
 # Testing code

@@ -1,7 +1,10 @@
 import re
 import collections
 
-from Utils import RecordTable, RecordStatistics, parse_utc_time_usecs, current_utc_time_usecs
+import numpy as np
+import pandas as pd
+
+from Utils import RecordTable, parse_utc_time_usecs, current_utc_time_usecs, decode_frontier, get_hostname
 
 
 """
@@ -62,7 +65,7 @@ class TomcatWatcher(object):
                         "kaacq": int,
                         "keepalives": int,
                         "time_start": int,
-                        "time_stop": int}
+                        "duration": int}
 
     regex_general = re.compile(r'^(?P<servlet>\S+) (?P<timestamp>(?:\S+ ){4})id=(?P<key>\S+) (?P<payload>.*)')
     regex_start = re.compile(r'servlet_version:(?P<version>\S+) start threads:(?P<threads_start>\d+) query (?P<query>\S+) raddr (?P<who>\S+) frontier-id: (?P<complement>.*)')
@@ -89,33 +92,16 @@ class TomcatWatcher(object):
 
         self.use_timestamps_in_log = use_timestamps_in_log
 
-        self.window_length_V = int (1e6 * window_length_secs)
+        self.window_length_V = int( 1e6 * window_length_secs)
         self.oldest_start_time = float("inf")
         self.newest_stop_time = 0
 
         self.history_H = collections.deque()
         initial_rows_estimation = 100 * int(window_length_secs)
-        self.data_D = RecordTable(self.record_variables,
-                                  initial_rows=initial_rows_estimation,
-                                  datatype = int)
-
+        self.data_D = RecordTable( self.record_variables,
+                                   initial_rows = initial_rows_estimation,
+                                   datatype = int )
         self._last_key = None
-
-        self.stats_list = (
-                {'filter': {'servlet':"FrontierProd"},
-                 'interest': 'query',
-                 'weighter': 'who',
-                 'action': 'tally'},
-                {'filter': {'servlet':"FrontierProd"},
-                 'interest': 'who',
-                 'weighter': 'size',
-                 'action': 'sum'},
-                {'filter': {'servlet':"smallfiles"},
-                 'interest': 'who',
-                 'weighter': 'size',
-                 'action': 'sum'}
-                )
-        self.statistics = RecordStatistics(self.stats_list)
 
     def parse_log_line (self, line_in):
 
@@ -149,10 +135,13 @@ class TomcatWatcher(object):
                 record['threads_start'] = int(record['threads_start'])
                 record['state'] = self.status_queued
                 record['keepalives'] = 0
+                record['who'] = get_hostname( record['who'])
+                record['query'] = decode_frontier( record['query'])
 
                 complement = record.pop('complement')
                 parts = complement.split(':')
-                record['fid'] = parts[0].replace(' x-forwarded-for', '').replace(' via', '')
+                record['fid'] = parts[0].replace(' x-forwarded-for', '')\
+                                        .replace(' via', '')
                 if len(parts) > 1:
                     if parts[-2].endswith(' x-forwarded-for'):
                         record['forward'] = parts[-1]
@@ -220,7 +209,7 @@ class TomcatWatcher(object):
             match = self.regex_kaacq.match(payload)
             if match:
                 record = self.data_D[key]
-                update = {'keepalives': record['keepalives'] + int(match.group('kaacq'))}
+                update = {'keepalives': int(match.group('kaacq'))}
                 self.data_D.modify (key, update)
                 return
 
@@ -257,10 +246,11 @@ class TomcatWatcher(object):
 
     def finish_record (self, key, timestamp, finish_mode):
 
-        update = {'time_stop': timestamp,
+        start_time = self.data_D.render_record( key, 'time_start')
+        update = {'duration': timestamp - start_time,
                   'state': self.status_stop,
                   'finish_mode': finish_mode}
-        self.data_D.modify (key, update)
+        self.data_D.modify( key, update)
 
         if self.newest_stop_time < timestamp:
             self.newest_stop_time = timestamp
@@ -288,3 +278,22 @@ class TomcatWatcher(object):
     def __len__(self):
         return len(self.history_H)
 
+def count_sum_stats (datagroup, quantile):
+
+    agg = datagroup.agg([np.sum, np.max, len, np.mean, np.std, np.min])
+    very_frequent = agg['len'] > agg['len'].quantile(quantile)
+    very_summ = agg['sum'] > agg['sum'].quantile(quantile)
+    agg = agg[ very_frequent | very_summ ]
+    agg.sort(['sum', 'amax', 'len'], ascending=False)
+
+    return agg
+
+def render_indices (dataframe, hashes):
+
+    index_names = dataframe.index.names
+    new_frame = dataframe.reset_index()
+    for name in index_names:
+        if name in hashes:
+            new_frame[name] = new_frame[name].map( lambda e: hashes[name](int(e)) )
+
+    return new_frame.set_index(index_names)
