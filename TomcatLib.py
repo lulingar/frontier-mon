@@ -54,6 +54,8 @@ class TomcatWatcher(object):
                         "forward": str,
                         "via": str,
                         "finish_mode": str,
+                        "if-modified-since": str,
+                        "other": str,
                         "threads_start": int,
                         "threads_stop": int,
                         "msecs_acq": int,
@@ -78,15 +80,40 @@ class TomcatWatcher(object):
     regex_sql = re.compile(r'SQL (?P<sql>.*)')
     regex_acq = re.compile(r'Acquiring DB (?P<dbacq>.*)')
     regex_exe = re.compile(r'Executing DB query')
-    regex_kaacq = re.compile(r'DB acquire sent keepalive (?P<kaacq>\d+)')
+    regex_kaacq = re.compile(r'DB (\S+) sent keepalive (?P<kaacq>\d+)')
+    regex_prc = re.compile(r'response was precommitted')
+    regex_ims_q = re.compile(r'if-modified-since: (?:(?:\S+ )*)')
+    regex_ims_qng = re.compile(r'getting last-modified time of (?:(?:\S+ )*)')
+    regex_ims_ret = re.compile(r'last-modified time: (?:(?:\S+ )*)')
+    regex_ims_h = re.compile(r'using cached last-modified time of (?:(?:\S+ )*)')
+    regex_ims_nc = re.compile(r'not modified (cached)')
+    regex_ims_n = re.compile(r'not modified')
 
     status_queued = 'queued'
     status_exec = 'executing'
     status_stop = 'finished'
+    status_precom = 'precommitted'
 
     finish_normal = 'ok'
     finish_timeout = 'timed-out'
     finish_error = 'aborted'
+
+    IMS_not_mod = 'not modified'
+    IMS_queried = 'queried'
+    IMS_querying = 'querying'
+    IMS_return = 'returned'
+    IMS_cachehit = 'cache hit'
+    IMS_not_mod_cached = 'not modified (cached)'
+
+    ims_update = ( (regex_ims_h, IMS_cachehit),
+                   (regex_ims_n, IMS_not_mod),
+                   (regex_ims_nc, IMS_not_mod_cached),
+                   (regex_ims_ret, IMS_return),
+                   (regex_ims_q, IMS_queried),
+                   (regex_ims_qng, IMS_querying), )
+
+    to_omit = ["don't know how to query timestamp for table dual",
+               'DB connection released remaining=']
 
     def __init__ (self, window_length_secs, use_timestamps_in_log=True):
 
@@ -102,6 +129,7 @@ class TomcatWatcher(object):
                                    initial_rows = initial_rows_estimation,
                                    datatype = int )
         self._last_key = None
+        self._last_timestamp = None
 
     def parse_log_line (self, line_in):
 
@@ -122,6 +150,7 @@ class TomcatWatcher(object):
                 timestamp = parse_utc_time_usecs (timestamp_log[:-12])
             else:
                 timestamp = current_utc_time_usecs()
+            self._last_timestamp = timestamp
 
             payload = record.pop('payload')
 
@@ -206,6 +235,12 @@ class TomcatWatcher(object):
                 self.data_D.modify (key, update)
                 return
 
+            match = self.regex_prc.match(payload)
+            if match:
+                update = {'state': self.status_precom}
+                self.data_D.modify (key, update)
+                return
+
             match = self.regex_kaacq.match(payload)
             if match:
                 record = self.data_D[key]
@@ -228,12 +263,26 @@ class TomcatWatcher(object):
                     print 'New error:', match.group('client')
                 #self.data_D.modify (key, update)
                 return
-            #print "No match!", line
+
+            for regex_, code_ in self.ims_update:
+                match = regex_.match(payload)
+                if match:
+                    update = {'if-modified-since': code_}
+                    self.data_D.modify (key, update)
+                    return
+
+            # Default
+            if not any([msg in payload for msg in self.to_omit]):
+                update = {'other': payload}
+                self.data_D.modify (key, update)
+                print key, update
+                return
 
         else:
             if 'xception' in line:
                 if self._last_key:
                     key = self._last_key
+                    timestamp = self._last_timestamp
                 else:
                     return
 
@@ -246,8 +295,10 @@ class TomcatWatcher(object):
 
     def finish_record (self, key, timestamp, finish_mode):
 
+        us_to_ms = 1e-3
         start_time = self.data_D.render_record( key, 'time_start')
-        update = {'duration': timestamp - start_time,
+
+        update = {'duration': (timestamp - start_time)*us_to_ms,
                   'state': self.status_stop,
                   'finish_mode': finish_mode}
         self.data_D.modify( key, update)
@@ -268,7 +319,10 @@ class TomcatWatcher(object):
 
         self.parse_log_line(line_in)
         self.update()
-        #self.statistics.get_statistics(self.data_D)
+
+    def clear(self):
+        self.data_D.clear()
+        self.history_H.clear()
 
     def current_window_length_secs (self):
 
@@ -278,22 +332,41 @@ class TomcatWatcher(object):
     def __len__(self):
         return len(self.history_H)
 
-def count_sum_stats (datagroup, quantile):
+def count_sum_stats (dataframe, group_fields, out_fields, quantile, elements_per_group):
 
-    agg = datagroup.agg([np.sum, np.max, len, np.mean, np.std, np.min])
-    very_frequent = agg['len'] > agg['len'].quantile(quantile)
+    aggregators = [('sum', np.sum), ('max', np.max),
+                   ('count', len), ('mean', np.mean),
+                   ('std-dev', np.std), ('min', np.min)]
+
+    datagroup = dataframe.groupby(group_fields, sort=False)[out_fields]
+    agg = datagroup.agg(aggregators)
+
+    very_frequent = agg['count'] > agg['count'].quantile(quantile)
     very_summ = agg['sum'] > agg['sum'].quantile(quantile)
-    agg = agg[ very_frequent | very_summ ]
-    agg.sort(['sum', 'amax', 'len'], ascending=False)
+    very_big = agg['max'] > agg['max'].quantile(quantile)
+    agg = agg[ very_frequent | very_summ | very_big ]
+
+    agg.sort(['sum', 'max', 'count'], ascending=False, inplace=True)
+    #agg = agg.groupby(level=0, group_keys=False).apply(lambda e: e.sort_index(by=['sum', 'max', 'count'], ascending=False).head(elements_per_group))
 
     return agg
 
 def render_indices (dataframe, hashes):
 
     index_names = dataframe.index.names
-    new_frame = dataframe.reset_index()
-    for name in index_names:
-        if name in hashes:
-            new_frame[name] = new_frame[name].map( lambda e: hashes[name](int(e)) )
+    if index_names[0]:
+        new_frame = dataframe.reset_index()
+    else:
+        new_frame = dataframe
+        index_names = hashes.keys()
 
-    return new_frame.set_index(index_names)
+    to_map = set(index_names) & set(hashes.keys())
+    for name in to_map:
+        new_frame[name] = new_frame[name].map( lambda e: hashes[name](int(e)),
+                                               na_action = 'ignore')
+
+    if index_names[0]:
+        return new_frame.set_index(index_names)
+    else:
+        return new_frame
+

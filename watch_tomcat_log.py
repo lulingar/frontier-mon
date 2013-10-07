@@ -50,59 +50,36 @@ def print_thread (signal, lock):
     tops = count_sum_stats
     render = render_indices
 
-    timing = np.zeros((10,))
-
-    hierarchy = ['servlet', 'query', 'who']
+    hierarchy = ['servlet', 'query', 'fid']
     num_stats = 12
 
     while not signal.is_set():
 
-        idx = 0
-        tic = time.time()
-
-        lines = ["At %s for the last %.2f seconds:" % ( time.strftime("%d/%b/%Y %H:%M:%S"), tw.current_window_length_secs() )]
-        lines.append("tam: %d" % (len(tw)))
+        lines = []
 
         if tw.current_window_length_secs() > 5:
             lock.acquire()
             data = pd.DataFrame( raw_table(), columns=list(variables))
             lock.release()
-            toc = time.time()
-            timing[idx] = toc - tic ; idx +=1; tic = toc
 
             #servlets = np.array(data.servlet.unique(), dtype=int)
 
             finished_ones = data[data['finish_mode'] == finish_codes[tw.finish_normal]]
 
-            by_SBW_group = finished_ones.groupby(hierarchy)['size']
-            by_SBW = render( tops( by_SBW_group, 0.8).head(num_stats), hashes)
+            by_SBW = render( tops( finished_ones, hierarchy, 'size', 0.8, 4).head(num_stats), hashes)
+            by_duration = render( tops( finished_ones, hierarchy, 'duration', 0.8, 4).head(num_stats), hashes)
 
-            toc = time.time()
-            timing[idx] = toc - tic ; idx +=1; tic = toc
-
-            by_duration_group = finished_ones.groupby(hierarchy)['duration']
-            by_duration = render( tops( by_duration_group, 0.8).head(num_stats), hashes)
-
-            toc = time.time()
-            timing[idx] = toc - tic ; idx +=1; tic = toc
-
-            lines.append('by size:')
+            """lines.append('by size:')
             lines.append(str(by_SBW))
             lines.append('by duration:')
-            lines.append(str(by_duration))
+            lines.append(str(by_duration))"""
 
+        lines.append("At %s for the last %.2f seconds:" % ( time.strftime("%d/%b/%Y %H:%M:%S"), tw.current_window_length_secs() ))
+        lines.append("tam: %d" % (len(tw)))
         out_text = '\n'.join(lines)
 
         #print chr(27) + "[2J"
-        #print out_text
-
-        so_far = timing[:idx]
-        total = so_far.sum()
-        print lines[0]
-        print "records:", len(tw)
-        print "times [ms]:", (so_far*1e3).round().astype(int)
-        print "as %:", (100*so_far/total).round().astype(int)
-        print "efficiency [rec/s]:", (len(tw)/so_far).round().astype(int), '\n'
+        print out_text
 
         """
         fout = open (os.path.expanduser('~/www/test.txt'), 'w')

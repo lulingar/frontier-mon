@@ -11,6 +11,7 @@ import sys
 import time
 import zlib
 
+from datetime import datetime
 from heapq import nsmallest
 from operator import itemgetter
 from string import maketrans
@@ -22,8 +23,8 @@ def current_utc_time_usecs():
     return int (1e6 * time.time())
 
 def parse_utc_time_usecs (timestamp):
-    usecs = int (1e6 * time.mktime (time.strptime (timestamp, "%m/%d/%y %H:%M:%S.%f")))
-    return usecs
+    secs = float( datetime.strptime( timestamp, "%m/%d/%y %H:%M:%S.%f").strftime('%s.%f'))
+    return int( 1e6 * secs )
 
 def lru_cache (maxsize=128):
     '''Least-recently-used cache decorator.
@@ -189,7 +190,6 @@ def decode_frontier (query):
 
 
 class IndexDict(object):
-#class IndexDict(collections.MutableMapping):
 
     def __init__ (self, iterable=None):
 
@@ -232,6 +232,11 @@ class IndexDict(object):
         item = self.ilist[index]
         self.ilist[index] = None
         del self.odict[item]
+
+    def clear (self):
+        self.ilist = []
+        self.odict = {}
+        self._reusable_indices = set()
 
     def __getitem__(self, item):
         if item in self.odict:
@@ -381,6 +386,10 @@ class RecordTable(object):
         index = self.index_table[key]
         self.index_table.remove_by_index(index)
         self.data_table[index,:] = ma.masked
+
+    def clear (self):
+        self.index_table.clear()
+        self.data_table.fill(ma.masked)
 
     def pop (self, key):
         record = self.render_record(key)
