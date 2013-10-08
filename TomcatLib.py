@@ -85,6 +85,7 @@ class TomcatWatcher(object):
     regex_ims_q = re.compile(r'if-modified-since: (?:(?:\S+ )*)')
     regex_ims_qng = re.compile(r'getting last-modified time of (?:(?:\S+ )*)')
     regex_ims_ret = re.compile(r'last-modified time: (?:(?:\S+ )*)')
+    regex_ims_mod = re.compile(r'modified at time: (?:(?:\S+ )*)')
     regex_ims_h = re.compile(r'using cached last-modified time of (?:(?:\S+ )*)')
     regex_ims_nc = re.compile(r'not modified (cached)')
     regex_ims_n = re.compile(r'not modified')
@@ -98,19 +99,21 @@ class TomcatWatcher(object):
     finish_timeout = 'timed-out'
     finish_error = 'aborted'
 
+    IMS_mod = 'modified'
     IMS_not_mod = 'not modified'
+    IMS_not_mod_cached = 'not modified (cached)'
     IMS_queried = 'queried'
     IMS_querying = 'querying'
     IMS_return = 'returned'
     IMS_cachehit = 'cache hit'
-    IMS_not_mod_cached = 'not modified (cached)'
 
     ims_update = ( (regex_ims_h, IMS_cachehit),
                    (regex_ims_n, IMS_not_mod),
                    (regex_ims_nc, IMS_not_mod_cached),
                    (regex_ims_ret, IMS_return),
                    (regex_ims_q, IMS_queried),
-                   (regex_ims_qng, IMS_querying), )
+                   (regex_ims_qng, IMS_querying),
+                   (regex_ims_mod, IMS_mod), )
 
     to_omit = ["don't know how to query timestamp for table dual",
                'DB connection released remaining=']
@@ -306,21 +309,24 @@ class TomcatWatcher(object):
         if self.newest_stop_time < timestamp:
             self.newest_stop_time = timestamp
 
-    def update (self):
+    def drop_last (self, timelapse, unit=1e6):
 
         current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
-        while current_timespan_usecs > self.window_length_V:
+        while current_timespan_usecs > timelapse*unit:
             dropped_key = self.history_H.popleft()
             self.oldest_start_time = self.data_D.render_record (dropped_key, 'time_start')
             del self.data_D[dropped_key]
             current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
+
+    def update (self):
+        self.drop_last(self.window_length_V, unit=1)
 
     def advance_records (self, line_in):
 
         self.parse_log_line(line_in)
         self.update()
 
-    def clear(self):
+    def clear (self):
         self.data_D.clear()
         self.history_H.clear()
 
@@ -328,6 +334,14 @@ class TomcatWatcher(object):
 
         current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
         return current_timespan_usecs * 1e-6
+
+    def as_dataframe (self):
+
+        df = pd.DataFrame(self.data_D.get_raw_values(), columns=list(self.data_D.column_table))
+        for col, mapping in self.data_D.hash_table.iteritems():
+            df[col] = df[col].map( lambda e: mapping(int(e)), na_action = 'ignore')
+
+        return df
 
     def __len__(self):
         return len(self.history_H)

@@ -16,9 +16,6 @@ from heapq import nsmallest
 from operator import itemgetter
 from string import maketrans
 
-# Remove buffering from stdout
-sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
-
 def current_utc_time_usecs():
     return int (1e6 * time.time())
 

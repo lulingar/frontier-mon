@@ -78,7 +78,7 @@ def print_thread (signal, lock):
         lines.append("tam: %d" % (len(tw)))
         out_text = '\n'.join(lines)
 
-        #print chr(27) + "[2J"
+        print chr(27) + "[2J"
         print out_text
 
         """
