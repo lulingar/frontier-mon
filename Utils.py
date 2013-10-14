@@ -2,26 +2,27 @@ import base64
 import copy
 import collections
 import functools
+import itertools
 import json
-import numpy as np
-import numpy.ma as ma
+import operator
 import os
 import socket
 import sys
 import time
 import zlib
 
-from datetime import datetime
+import numpy as np
+import numpy.ma as ma
+import pandas as pd
+
 from heapq import nsmallest
 from operator import itemgetter
 from string import maketrans
 
+from tacit import tac
+
 def current_utc_time_usecs():
     return int (1e6 * time.time())
-
-def parse_utc_time_usecs (timestamp):
-    secs = float( datetime.strptime( timestamp, "%m/%d/%y %H:%M:%S.%f").strftime('%s.%f'))
-    return int( 1e6 * secs )
 
 def lru_cache (maxsize=128):
     '''Least-recently-used cache decorator.
@@ -152,6 +153,67 @@ class TimeWindowedRecord(object):
         return json.dumps ({'window': self.window_length_V,
                            'history': list(self.history_H)})
 
+class LogStatistician(object):
+
+    def __init__ (self, window_length_secs, initial_rows_estimate, use_timestamps_in_log):
+
+        self.use_timestamps_in_log = use_timestamps_in_log
+
+        self.window_length_V = int( 1e6 * window_length_secs)
+        self.oldest_timestamp = None
+        self.newest_timestamp = None
+
+        self.history_H = collections.deque()
+        self.data_D = RecordTable( self.record_variables,
+                                   initial_rows = initial_rows_estimate,
+                                   datatype = int )
+        self._last_timestamp = None
+
+    def parse_log_line (self, line_in):
+        raise NotImplementedError()
+
+    def drop_oldest (self, timelapse, unit=1e6):
+
+        if timelapse > 0:
+            current_timespan_usecs = self.newest_timestamp - self.oldest_timestamp
+            while current_timespan_usecs > timelapse * unit:
+                dropped_key = self.history_H.popleft()
+                self.oldest_timestamp = self.data_D.render_record (dropped_key, 'time_start')
+                del self.data_D[dropped_key]
+                current_timespan_usecs = self.newest_timestamp - self.oldest_timestamp
+
+    def update (self):
+        self.drop_oldest(self.window_length_V, unit=1)
+
+    def advance_records (self, line_in):
+
+        self.parse_log_line(line_in)
+        self.update()
+
+    def clear (self):
+
+        self.data_D.clear()
+        self.history_H.clear()
+        self.oldest_timestamp = None
+        self.newest_timestamp = None
+        self._last_timestamp = None
+
+    def current_window_length_secs (self):
+
+        current_timespan_usecs = self.newest_timestamp - self.oldest_timestamp
+        return current_timespan_usecs * 1e-6
+
+    def as_dataframe (self):
+
+        df = pd.DataFrame(self.data_D.get_raw_values(), columns=list(self.data_D.column_table))
+        for col, mapping in self.data_D.hash_table.iteritems():
+            df[col] = df[col].map( lambda e: mapping(int(e)),
+                                   na_action = 'ignore')
+
+        return df
+
+    def __len__(self):
+        return len(self.history_H)
 
 @lfu_cache(maxsize=1024)
 def get_hostname (ip):
@@ -418,44 +480,58 @@ class RecordTable(object):
     #TODO: Pretty-print current table records
 
 
-# Testing code
-if __name__ == "__main__":
+def count_sum_stats (dataframe, group_fields, out_fields, quantile, elements_per_group):
 
-    import random
-    import threading
+    aggregators = [('sum', np.sum), ('max', np.max),
+                   ('count', len), ('mean', np.mean),
+                   ('std-dev', np.std), ('min', np.min)]
 
-    object_bag = ["algo", "bueeenas", "dksdjiw", "dykstra", "agent", "test"]
-    watch = TimeWindowedRecord (4)
+    datagroup = dataframe.groupby(group_fields, sort=False)[out_fields]
+    agg = datagroup.agg(aggregators)
 
-    def feed_events (signal):
-        while not signal.is_set():
-            signal.wait( random.gauss(1, 1) )
-            print "<feed!>"
-            watch.event( random.choice(object_bag))
+    very_frequent = agg['count'] > agg['count'].quantile(quantile)
+    very_summ = agg['sum'] > agg['sum'].quantile(quantile)
+    very_big = agg['max'] > agg['max'].quantile(quantile)
+    agg = agg[ very_frequent | very_summ | very_big ]
 
-    def show_window (signal):
-        while not signal.is_set():
-            signal.wait(2)
-            now = time.strftime("%H:%M:%S", time.gmtime())
-            try:
-                pairs = [ "%s (%.3f)" % (x[1], x[0]/1e6) for x in watch.history_H ]
-                print now, watch.interval_sum_L/1e6, pairs
-            except KeyError:
-                print watch.history_H
-                print watch.object_table_T
+    agg.sort(['sum', 'max', 'count'], ascending=False, inplace=True)
+    #agg = agg.groupby(level=0, group_keys=False).apply(lambda e: e.sort_index(by=['sum', 'max', 'count'], ascending=False).head(elements_per_group))
 
-    threads_signal = threading.Event()
-    t_f = threading.Thread (target=feed_events, name='feed', args=(threads_signal,))
-    t_s = threading.Thread (target=show_window, name='show', args=(threads_signal,))
+    return agg
 
-    t_f.start()
-    t_s.start()
-    try:
-        while True: time.sleep(100)
-    except (KeyboardInterrupt, SystemExit):
-        print "Exitting...",
-        threads_signal.set()
-        t_f.join()
-        t_s.join()
-        print "success!"
+def render_indices (dataframe, hashes):
+
+    index_names = dataframe.index.names
+    if index_names[0]:
+        new_frame = dataframe.reset_index()
+    else:
+        new_frame = dataframe
+        index_names = hashes.keys()
+
+    to_map = set(index_names) & set(hashes.keys())
+    for name in to_map:
+        new_frame[name] = new_frame[name].map( lambda e: hashes[name](int(e)),
+                                               na_action = 'ignore')
+
+    if index_names[0]:
+        return new_frame.set_index(index_names)
+    else:
+        return new_frame
+
+def get_last_n_lines (filename, n=1):
+    i = 0
+    lines = []
+    for line in tac(filename):
+        lines.append(line)
+        i +=1
+        if i == n: break
+    return ''.join(lines)
+
+def save_object (save_file, dictionary):
+    with open(save_file, 'w') as fd:
+        json.dump(dictionary, fd)
+
+def is_strictly_increasing(lst):
+    op = operator.lt
+    return all(op(x, y) for x, y in itertools.izip(lst, lst[1:]))
 

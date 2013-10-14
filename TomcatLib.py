@@ -1,10 +1,17 @@
+import bisect
+import json
+import os
 import re
-import collections
+import shutil
 
-import numpy as np
-import pandas as pd
+from datetime import datetime, timedelta
+from dateutil.tz import tzutc
+from dateutil.parser import parse
+from glob import glob
 
-from Utils import RecordTable, parse_utc_time_usecs, current_utc_time_usecs, decode_frontier, get_hostname
+from tacit import tac
+
+from Utils import LogStatistician, current_utc_time_usecs, decode_frontier, get_hostname
 
 
 """
@@ -40,7 +47,7 @@ The other kind of entry is that of an exception. An example is:
     <a blank line>
 """
 
-class TomcatWatcher(object):
+class TomcatWatcher(LogStatistician):
 
     record_variables = {"servlet": str,
                         "version": str,
@@ -120,19 +127,11 @@ class TomcatWatcher(object):
 
     def __init__ (self, window_length_secs, use_timestamps_in_log=True):
 
-        self.use_timestamps_in_log = use_timestamps_in_log
-
-        self.window_length_V = int( 1e6 * window_length_secs)
-        self.oldest_start_time = float("inf")
-        self.newest_stop_time = 0
-
-        self.history_H = collections.deque()
         initial_rows_estimation = 100 * int(window_length_secs)
-        self.data_D = RecordTable( self.record_variables,
-                                   initial_rows = initial_rows_estimation,
-                                   datatype = int )
+        LogStatistician.__init__( self, window_length_secs,
+                                        initial_rows_estimation,
+                                        use_timestamps_in_log )
         self._last_key = None
-        self._last_timestamp = None
 
     def parse_log_line (self, line_in):
 
@@ -150,7 +149,7 @@ class TomcatWatcher(object):
 
             timestamp_log = record.pop('timestamp')
             if self.use_timestamps_in_log:
-                timestamp = parse_utc_time_usecs (timestamp_log[:-12])
+                timestamp = parse_utc_time_usecs (timestamp_log)
             else:
                 timestamp = current_utc_time_usecs()
             self._last_timestamp = timestamp
@@ -159,9 +158,6 @@ class TomcatWatcher(object):
 
             match = self.regex_start.match(payload)
             if match:
-                if self.oldest_start_time > timestamp:
-                    self.oldest_start_time = timestamp
-
                 record.update (match.groupdict())
                 record['time_start'] = timestamp
                 record['threads_start'] = int(record['threads_start'])
@@ -181,6 +177,10 @@ class TomcatWatcher(object):
 
                 self.data_D[key] = record
                 self.history_H.append (key)
+
+                self.newest_timestamp = timestamp
+                oldest_key = self.history_H[0]
+                self.oldest_timestamp = self.data_D.render_record (oldest_key, 'time_start')
                 return
 
             if key in self.data_D:
@@ -294,7 +294,7 @@ class TomcatWatcher(object):
             elif line.startswith('at '):
                 return
             else:
-                print "Unforseen line:", line
+                print "Unforeseen line:", line
 
     def finish_record (self, key, timestamp, finish_mode):
 
@@ -306,81 +306,206 @@ class TomcatWatcher(object):
                   'finish_mode': finish_mode}
         self.data_D.modify( key, update)
 
-        if self.newest_stop_time < timestamp:
-            self.newest_stop_time = timestamp
+epoch_origin = datetime.utcfromtimestamp(0).replace(tzinfo=tzutc())
 
-    def drop_last (self, timelapse, unit=1e6):
+def parse_utc_time_usecs (timestamp_str):
 
-        current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
-        while current_timespan_usecs > timelapse*unit:
-            dropped_key = self.history_H.popleft()
-            self.oldest_start_time = self.data_D.render_record (dropped_key, 'time_start')
-            del self.data_D[dropped_key]
-            current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
+    timestamp = parse( timestamp_str,
+                       dayfirst = False, yearfirst= False )
+    return int( 1e6 * (timestamp - epoch_origin).total_seconds() )
 
-    def update (self):
-        self.drop_last(self.window_length_V, unit=1)
+def get_first_timestamp (file_name):
+    for line in open(file_name):
+        if " start " in line:
+            return ' '.join(line.split()[1:4])
 
-    def advance_records (self, line_in):
+def get_lines_between_timestamps (file_name, start_ts, end_ts):
 
-        self.parse_log_line(line_in)
-        self.update()
+    generate = False
+    with open(file_name) as fd:
+        for line in fd:
 
-    def clear (self):
-        self.data_D.clear()
-        self.history_H.clear()
+            if " start " in line:
+                timestamp_str = ' '.join(line.split(' ', 6)[1:4])
+                timestamp = parse_utc_time_usecs(timestamp_str)
+                generate = (start_ts <= timestamp < end_ts)
+                if timestamp >= end_ts:
+                    break
 
-    def current_window_length_secs (self):
+            if generate:
+                yield line
 
-        current_timespan_usecs = self.newest_stop_time - self.oldest_start_time
-        return current_timespan_usecs * 1e-6
 
-    def as_dataframe (self):
+def get_last_timestamp (file_name):
+    for line in tac(file_name):
+        if " start " in line:
+            return ' '.join(line.split()[1:4])
 
-        df = pd.DataFrame(self.data_D.get_raw_values(), columns=list(self.data_D.column_table))
-        for col, mapping in self.data_D.hash_table.iteritems():
-            df[col] = df[col].map( lambda e: mapping(int(e)), na_action = 'ignore')
+def build_timestamps_str (base_path):
+    timestamps_lib = {}
+    for machine in (1, 2, 3):
+        blocks = glob( base_path.format( machine) + '*')
+        timestamps_lib[machine] = {}
+        for block in blocks:
+            first = get_first_timestamp(block)
+            last = get_last_timestamp(block)
+            simple_block = block.split(base_path.format(machine))[1]
+            timestamps_lib[machine][simple_block] = [first, last]
 
-        return df
+    return timestamps_lib
 
-    def __len__(self):
-        return len(self.history_H)
+def sort_blocks (timestamps_lib, base_path, block_path ):
 
-def count_sum_stats (dataframe, group_fields, out_fields, quantile, elements_per_group):
+    for machine in timestamps_lib.keys():
 
-    aggregators = [('sum', np.sum), ('max', np.max),
-                   ('count', len), ('mean', np.mean),
-                   ('std-dev', np.std), ('min', np.min)]
+        by_first = [ e[0] for e in sorted(timestamps_lib[machine].items(), key=lambda e: e[1][0]) ]
+        by_last = [ e[0] for e in sorted(timestamps_lib[machine].items(), key=lambda e: e[1][1]) ]
+        print machine, by_first == by_last
 
-    datagroup = dataframe.groupby(group_fields, sort=False)[out_fields]
-    agg = datagroup.agg(aggregators)
+        if by_first == by_last:
 
-    very_frequent = agg['count'] > agg['count'].quantile(quantile)
-    very_summ = agg['sum'] > agg['sum'].quantile(quantile)
-    very_big = agg['max'] > agg['max'].quantile(quantile)
-    agg = agg[ very_frequent | very_summ | very_big ]
+            for old in by_first:
+                source = base_path.format(machine) + old
+                shutil.move(source, source + '.in')
 
-    agg.sort(['sum', 'max', 'count'], ascending=False, inplace=True)
-    #agg = agg.groupby(level=0, group_keys=False).apply(lambda e: e.sort_index(by=['sum', 'max', 'count'], ascending=False).head(elements_per_group))
+            for new, old in enumerate(by_first):
+                source = base_path.format(machine) + old + '.in'
+                target = block_path.format(machine, new)
+                shutil.move(source, target)
 
-    return agg
+            new_ts = {}
+            for new, old in enumerate(by_first):
+                new_ts[new] = timestamps_lib[machine][old]
+            timestamps_lib[machine] = new_ts
 
-def render_indices (dataframe, hashes):
+class BlockRecord(object):
 
-    index_names = dataframe.index.names
-    if index_names[0]:
-        new_frame = dataframe.reset_index()
-    else:
-        new_frame = dataframe
-        index_names = hashes.keys()
+    def __init__ (self, work_path, specifier, savefile):
 
-    to_map = set(index_names) & set(hashes.keys())
-    for name in to_map:
-        new_frame[name] = new_frame[name].map( lambda e: hashes[name](int(e)),
-                                               na_action = 'ignore')
+        self.base_path = work_path + '{0:d}/' + specifier + '/'
+        self.block_path = self.base_path + '{1:03d}'
+        self.save_file = savefile
 
-    if index_names[0]:
-        return new_frame.set_index(index_names)
-    else:
-        return new_frame
+    def load (self):
+
+        with open(self.save_file) as fd:
+            timestamps_lib = json.load(fd)
+
+        tables_first = {}
+        #tables_last = {}
+        for machine, table in timestamps_lib.items():
+            first, last = zip(*sorted(table.values()))
+            tables_first[int(machine)] = map(parse, first)
+            #tables_last[int(machine)] = map(parse, last)
+
+        self.tables = tables_first
+
+    def get_block (self, timestamp, machine):
+
+        table = self.tables[machine]
+
+        if isinstance(timestamp, str):
+            _ts = parse(timestamp)
+        elif isinstance(timestamp, datetime):
+            _ts = timestamp
+        elif isinstance(timestamp, int):
+            _ts = datetime.fromtimestamp(timestamp*1e-6, tzutc())
+
+        idx = bisect.bisect(table, _ts) - 1
+        if 0 <= idx < len(table):
+            return idx
+
+        raise ValueError
+
+    def get_file (self, block, machine):
+
+        if 0 <= block < len(self.tables[machine]):
+            return self.block_path.format(machine, block)
+        raise IndexError
+
+class TomcatView(object):
+
+    def __init__ (self, work_path, specifier, block_map_file, window_length_secs):
+
+        self.blocks = BlockRecord(work_path, specifier, block_map_file)
+        self.blocks.load()
+
+        self.watch = TomcatWatcher(window_length_secs, True)
+
+        self.window_length = timedelta(seconds=window_length_secs)
+        self.start = None
+        self.end = None
+
+    def set_start (self, dt_start, move_end=True):
+
+        if isinstance(dt_start, datetime):
+            self.start = dt_start
+        elif isinstance(dt_start, timedelta):
+            self.start += dt_start
+
+        if self.end and not move_end:
+            self.window_length = self.end - self.start
+        else:
+            self.end = self.start + self.window_length
+        self._update_spec()
+
+    def set_end (self, dt_end, move_start=True):
+
+        if isinstance(dt_end, datetime):
+            self.end = dt_end
+        elif isinstance(dt_end, timedelta):
+            self.end += dt_end
+
+        if self.start and not move_start:
+            self.window_length = self.end - self.start
+        else:
+            self.start = self.end - self.window_length
+        self._update_spec()
+
+    def set_window (self, window_length_secs, move_start=True):
+        self.window_length = timedelta(seconds=window_length_secs)
+        if move_start:
+            self.set_end(self.end)
+        else:
+            self.set_start(self.start)
+        self._update_spec()
+
+    def get_dataframe (self):
+
+        return self.watch.as_dataframe()
+
+    def load_data (self, machine):
+
+        # For the time being
+        self.watch.clear()
+
+        oldest = self.watch.oldest_timestamp
+        newest = self.watch.newest_timestamp
+
+        if oldest is None or self._start_u < oldest:
+            start_reading = self._start_u
+        else:
+            start_reading = oldest + 1
+
+        if newest is None or self._end_u > newest:
+            stop_reading = self._end_u
+        else:
+            stop_reading = newest + 1
+
+        start_block = self.blocks.get_block(start_reading, machine)
+        end_block = self.blocks.get_block(stop_reading, machine)
+        for block in range(start_block, end_block+1):
+            filename = self.blocks.get_file( block, machine)
+            readline = get_lines_between_timestamps( filename, start_reading,
+                                                               stop_reading )
+            for line in readline:
+                self.watch.parse_log_line(line)
+
+        watch_length = self.watch.current_window_length_secs()
+        remaining = watch_length - self.window_length.seconds
+        self.watch.drop_oldest(remaining)
+
+    def _update_spec (self):
+        self._start_u = int( 1e6 * (self.start - epoch_origin).total_seconds() )
+        self._end_u = int( 1e6 * (self.end - epoch_origin).total_seconds() )
 
