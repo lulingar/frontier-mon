@@ -15,6 +15,7 @@ import numpy as np
 import numpy.ma as ma
 import pandas as pd
 
+from glob import glob
 from heapq import nsmallest
 from operator import itemgetter
 from string import maketrans
@@ -192,7 +193,7 @@ class LogStatistician(object):
 
     def clear (self):
 
-        self.data_D.clear()
+        self.data_D.clear(full=False)
         self.history_H.clear()
         self.oldest_timestamp = None
         self.newest_timestamp = None
@@ -200,8 +201,11 @@ class LogStatistician(object):
 
     def current_window_length_secs (self):
 
-        current_timespan_usecs = self.newest_timestamp - self.oldest_timestamp
-        return current_timespan_usecs * 1e-6
+        if self.newest_timestamp and self.oldest_timestamp:
+            current_timespan_usecs = self.newest_timestamp - self.oldest_timestamp
+            return current_timespan_usecs * 1e-6
+        else:
+            return -1
 
     def as_dataframe (self):
 
@@ -209,7 +213,6 @@ class LogStatistician(object):
         for col, mapping in self.data_D.hash_table.iteritems():
             df[col] = df[col].map( lambda e: mapping(int(e)),
                                    na_action = 'ignore')
-
         return df
 
     def __len__(self):
@@ -293,9 +296,9 @@ class IndexDict(object):
         del self.odict[item]
 
     def clear (self):
-        self.ilist = []
-        self.odict = {}
-        self._reusable_indices = set()
+        del self.ilist[:]
+        self.odict.clear()
+        self._reusable_indices.clear()
 
     def __getitem__(self, item):
         if item in self.odict:
@@ -349,14 +352,18 @@ class RecordTable(object):
 
         self._data_type = datatype
         self._data_table_growth_factor = 0.3
+        self._variables = variables
 
         self.column_table = IndexDict()
         self.hash_table = {}
         self.index_table = IndexDict()
         self.data_table = ma.masked_all( (initial_rows, len(variables)),
                                          dtype = self._data_type )
+        self._populate_indices()
 
-        for name, vartype in variables.items():
+    def _populate_indices (self):
+
+        for name, vartype in self._variables.items():
             self.column_table.add (name)
             if vartype not in (int, long, float):
                 self.hash_table[name] = IndexDict()
@@ -446,9 +453,13 @@ class RecordTable(object):
         self.index_table.remove_by_index(index)
         self.data_table[index,:] = ma.masked
 
-    def clear (self):
+    def clear (self, full=False):
         self.index_table.clear()
         self.data_table.fill(ma.masked)
+        if full:
+            self.column_table.clear()
+            self.hash_table.clear()
+            self._populate_indices()
 
     def pop (self, key):
         record = self.render_record(key)
@@ -534,4 +545,157 @@ def save_object (save_file, dictionary):
 def is_strictly_increasing(lst):
     op = operator.lt
     return all(op(x, y) for x, y in itertools.izip(lst, lst[1:]))
+
+def get_first_timestamp (file_name, timestamp_fcn):
+    for line in open(file_name):
+        ts = timestamp_fcn(line)
+        if ts:
+            return ts
+
+def get_last_timestamp (file_name, timestamp_fcn):
+    for line in tac(file_name):
+        ts = timestamp_fcn(line)
+        if ts:
+            return ts
+
+def iternamedtuples (dataframe):
+    Row = collections.namedtuple('Row', dataframe.columns)
+    for row in dataframe.itertuples():
+        yield Row(*row[1:])
+
+def gather_stats (machine, time_span, watch, path_specifier, work_path,
+                  processing_f, ts_getter, ts_parser, max_in_core=400e3):
+
+    def close_bin (chunks, watch, machine, block_start, block_end, processing_f):
+
+        chunks.append(watch.as_dataframe())
+        aggregation = processing_f( pd.concat( chunks))
+
+        start_spec = blk_line_spec.format(*block_start)
+        end_spec = blk_line_spec.format(*block_end)
+        aggregation['block_start'] = start_spec
+        aggregation['block_end'] = end_spec
+        print "{machine}: closed bin: {0} -> {1}".format(start_spec, end_spec, machine=machine)
+
+        pickled = list( iternamedtuples( aggregation))
+        return pickled
+
+    blk_line_spec = "{0:03d}:{1:d}"
+    base_path = work_path + '{0:d}/{1}/'
+    blocks = glob( base_path.format( machine, path_specifier) + '[0-9]*')
+    start, end, time_bin = time_span
+    time_bin_secs = time_bin.total_seconds()
+
+    dframes = []
+    chunks = []
+    first_chunk = True
+    new_bin = False
+    watch.clear()
+
+    for block in sorted(blocks):
+
+        block_num = int(block.split('/')[-1])
+        first = ts_parser( get_first_timestamp( block, ts_getter))
+        last = ts_parser( get_last_timestamp( block, ts_getter))
+
+        if start > last:
+            continue
+        if end < first:
+            break
+
+        for line_num, line in enumerate(open(block)):
+
+            if ts_getter(line):
+                ts = ts_parser( ts_getter(line))
+                if ts < start:
+                    continue
+                if ts > end:
+                    break
+            else:
+                if first_chunk:
+                    continue
+
+            if first_chunk:
+                first_chunk = False
+                new_bin = True
+                print "{machine}: First chunk !".format(machine=machine)
+
+            if new_bin:
+                start_block, start_line = block_num, line_num
+                print "{machine}: new bin at".format(machine=machine), blk_line_spec.format(start_block, start_line)
+                new_bin = False
+
+            try:
+                watch.parse_log_line(line)
+            except KeyError:
+                print "{machine}: duplicated key, restoring chunk...".format(machine=machine)
+                chunks.append(watch.as_dataframe())
+                watch.clear()
+                watch.parse_log_line(line)
+
+            collected_time = watch.current_window_length_secs()
+            in_core = len(watch)
+            if collected_time >= time_bin_secs or in_core > max_in_core:
+                print "{machine}: Collected time: {0:f}".format(collected_time, machine=machine)
+                print "{machine}: --------\n".format(machine=machine)
+                dframes.append( close_bin( chunks, watch, machine,
+                                          (start_block, start_line),
+                                          (block_num, line_num), processing_f))
+                new_bin = True
+                watch.clear()
+                del chunks[:]
+
+        dframes.append( close_bin( chunks, watch, machine,
+                                   (start_block, start_line),
+                                   (block_num, line_num), processing_f))
+
+    if dframes:
+        nframes = []
+        while dframes:
+            frame = dframes.pop(0)
+            assembly = pd.DataFrame(frame, columns=frame[0]._fields)
+            nframes.append(assembly)
+        assembly = pd.concat(nframes)
+        save_file = base_path.format( machine, path_specifier) + "assembly.json"
+        assembly.to_json(save_file, 'records')
+        print "File {0} written.".format(save_file)
+        return assembly.to_dict()
+    else:
+        return {}
+
+def aggregator (work_path, specifier):
+
+    ag = {}
+    for idx in (1, 2, 3):
+        ag[idx] = pd.read_json("{2}/{0:d}/{1}/assembly.json".format(idx, specifier, work_path))
+
+    agp = pd.Panel(ag)
+    agl = agp.transpose(items='minor', major='major', minor='items')\
+                        .to_frame(filter_observations=False)\
+                        .reset_index(level=1)
+    agl.rename( columns={'minor':'machine'}, inplace=True)
+    agl.index.names = ['']
+    agl = agl[agl.time_start.notnull()]
+    agl.time_start = pd.to_datetime(agl.time_start, utc=True, unit='us')
+    agl.time_end = pd.to_datetime(agl.time_end, utc=True, unit='us')
+    agl.set_index( 'time_start', inplace=True)
+    agl.sort_index( inplace=True)
+    agl.fillna( 0, inplace=True)
+
+    return agl
+
+def resampled_pivot (dataframe, index, column, values, resample_spec, resample_how):
+
+    indexed = dataframe.set_index([index])
+    column_values = dataframe[column].unique()
+    dataframe_cols = {}
+
+    for col_value in column_values:
+
+        filtered = indexed[ indexed[column] == col_value ]
+        series = filtered[values]
+        series = series.resample (resample_spec, how=resample_how)
+        dataframe_cols[col_value] = series
+
+    return pd.DataFrame(dataframe_cols).fillna(0)
 
