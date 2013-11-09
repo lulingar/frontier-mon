@@ -10,22 +10,24 @@ import dateutil
 import TomcatLib
 import Utils
 
+#specifier = "cat.out.full.gz"
+specifier = "cat.out.full"
+
 def complete_tomcat_assemble (machine, out_q, start, end, time_bin, work_path):
 
     watch = TomcatLib.TomcatWatcher(20*60, True)
-    recs = Utils.gather_stats(machine, [start, end, time_bin], watch, "cat.out", work_path,
+    recs = Utils.gather_stats(machine, [start, end, time_bin], watch, specifier, work_path,
                               TomcatLib.tomcat_aggregator, TomcatLib.get_timestamp,
-                              TomcatLib.parse_tomcat_timedate)
+                              TomcatLib.parse_tomcat_timedate, max_in_core=120e3)
     out_q.put((machine, recs))
 
 def main ():
 
     work_path = '/afs/cern.ch/user/l/llinares/work/private/frontier/madgraph_incident_201309/'
-    tomcat_block_path = work_path + '{0:d}/cat.out/{1:03d}'
 
     start = datetime(2013, 9, 7, 3, 0, 0, tzinfo=dateutil.tz.tzlocal())
     end = datetime(2013, 9, 8, 23, 0, 0, tzinfo=dateutil.tz.tzlocal())
-    time_bin = timedelta(minutes=10)
+    time_bin = timedelta(minutes=2)
 
     tic = datetime.now()
 
@@ -40,9 +42,10 @@ def main ():
     for p in processes:
         p.join()
 
-    agg = Utils.aggregator(work_path, 'cat.out')
+    agg = Utils.aggregator(work_path, specifier)
     csv_file = work_path + 'tomcat_aggregation.csv'
-    agg.to_csv(csv_file)
+    agg.to_csv(csv_file, index=False)
+    print "File {0} written.".format(csv_file)
 
     print "Tomcat elapsed:", str(datetime.now() - tic)
 

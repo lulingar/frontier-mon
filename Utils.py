@@ -1,7 +1,9 @@
 import base64
+import bisect
 import copy
 import collections
 import functools
+import gzip
 import itertools
 import json
 import operator
@@ -14,6 +16,7 @@ import zlib
 import numpy as np
 import numpy.ma as ma
 import pandas as pd
+pd.options.display.max_columns = 40
 
 from glob import glob
 from heapq import nsmallest
@@ -491,25 +494,6 @@ class RecordTable(object):
     #TODO: Pretty-print current table records
 
 
-def count_sum_stats (dataframe, group_fields, out_fields, quantile, elements_per_group):
-
-    aggregators = [('sum', np.sum), ('max', np.max),
-                   ('count', len), ('mean', np.mean),
-                   ('std-dev', np.std), ('min', np.min)]
-
-    datagroup = dataframe.groupby(group_fields, sort=False)[out_fields]
-    agg = datagroup.agg(aggregators)
-
-    very_frequent = agg['count'] > agg['count'].quantile(quantile)
-    very_summ = agg['sum'] > agg['sum'].quantile(quantile)
-    very_big = agg['max'] > agg['max'].quantile(quantile)
-    agg = agg[ very_frequent | very_summ | very_big ]
-
-    agg.sort(['sum', 'max', 'count'], ascending=False, inplace=True)
-    #agg = agg.groupby(level=0, group_keys=False).apply(lambda e: e.sort_index(by=['sum', 'max', 'count'], ascending=False).head(elements_per_group))
-
-    return agg
-
 def render_indices (dataframe, hashes):
 
     index_names = dataframe.index.names
@@ -566,23 +550,17 @@ def iternamedtuples (dataframe):
 def gather_stats (machine, time_span, watch, path_specifier, work_path,
                   processing_f, ts_getter, ts_parser, max_in_core=400e3):
 
-    def close_bin (chunks, watch, machine, block_start, block_end, processing_f):
+    def close_bin (chunks, watch, machine, block_start, processing_f):
 
         chunks.append(watch.as_dataframe())
         aggregation = processing_f( pd.concat( chunks))
-
-        start_spec = blk_line_spec.format(*block_start)
-        end_spec = blk_line_spec.format(*block_end)
-        aggregation['block_start'] = start_spec
-        aggregation['block_end'] = end_spec
-        print "{machine}: closed bin: {0} -> {1}".format(start_spec, end_spec, machine=machine)
-
+        aggregation['block_start'] = block_start
         pickled = list( iternamedtuples( aggregation))
+
         return pickled
 
-    blk_line_spec = "{0:03d}:{1:d}"
-    base_path = work_path + '{0:d}/{1}/'
-    blocks = glob( base_path.format( machine, path_specifier) + '[0-9]*')
+    base_path = work_path + '{0:d}/{1}'
+    logfile = base_path.format( machine, path_specifier)
     start, end, time_bin = time_span
     time_bin_secs = time_bin.total_seconds()
 
@@ -590,20 +568,14 @@ def gather_stats (machine, time_span, watch, path_specifier, work_path,
     chunks = []
     first_chunk = True
     new_bin = False
+    previous_line_index = LagFactory(0)
     watch.clear()
 
-    for block in sorted(blocks):
+    log_size = os.path.getsize(logfile)
 
-        block_num = int(block.split('/')[-1])
-        first = ts_parser( get_first_timestamp( block, ts_getter))
-        last = ts_parser( get_last_timestamp( block, ts_getter))
-
-        if start > last:
-            continue
-        if end < first:
-            break
-
-        for line_num, line in enumerate(open(block)):
+    with open(logfile) as log:
+        for line in log:
+            previous_line_index(log.tell())
 
             if ts_getter(line):
                 ts = ts_parser( ts_getter(line))
@@ -618,56 +590,47 @@ def gather_stats (machine, time_span, watch, path_specifier, work_path,
             if first_chunk:
                 first_chunk = False
                 new_bin = True
-                print "{machine}: First chunk !".format(machine=machine)
 
             if new_bin:
-                start_block, start_line = block_num, line_num
-                print "{machine}: new bin at".format(machine=machine), blk_line_spec.format(start_block, start_line)
+                block_start = previous_line_index()
                 new_bin = False
 
             try:
                 watch.parse_log_line(line)
             except KeyError:
-                print "{machine}: duplicated key, restoring chunk...".format(machine=machine)
                 chunks.append(watch.as_dataframe())
                 watch.clear()
                 watch.parse_log_line(line)
 
             collected_time = watch.current_window_length_secs()
             in_core = len(watch)
-            if collected_time >= time_bin_secs or in_core > max_in_core:
-                print "{machine}: Collected time: {0:f}".format(collected_time, machine=machine)
-                print "{machine}: --------\n".format(machine=machine)
-                dframes.append( close_bin( chunks, watch, machine,
-                                          (start_block, start_line),
-                                          (block_num, line_num), processing_f))
+            if collected_time > time_bin_secs or in_core > max_in_core:
+
+                print "{0}: +{1:f} ({2:.2f} %)".format(machine, collected_time, 100*float(log.tell())/log_size)
+                dframes.append( close_bin( chunks, watch, machine, block_start, processing_f))
                 new_bin = True
                 watch.clear()
                 del chunks[:]
 
-        dframes.append( close_bin( chunks, watch, machine,
-                                   (start_block, start_line),
-                                   (block_num, line_num), processing_f))
+    if not first_chunk:
+        dframes.append( close_bin( chunks, watch, machine, block_start, processing_f))
 
     if dframes:
-        nframes = []
-        while dframes:
-            frame = dframes.pop(0)
-            assembly = pd.DataFrame(frame, columns=frame[0]._fields)
-            nframes.append(assembly)
-        assembly = pd.concat(nframes)
-        save_file = base_path.format( machine, path_specifier) + "assembly.json"
-        assembly.to_json(save_file, 'records')
+        assembly = pd.concat( (pd.DataFrame(frame, columns=frame[0]._fields) for frame in dframes), ignore_index=True )
+
+        save_file = base_path.format( machine, path_specifier) + ".assembly.csv"
+        assembly.to_csv(save_file, index=False)
         print "File {0} written.".format(save_file)
-        return assembly.to_dict()
-    else:
-        return {}
+
+    return
 
 def aggregator (work_path, specifier):
 
     ag = {}
     for idx in (1, 2, 3):
-        ag[idx] = pd.read_json("{2}/{0:d}/{1}/assembly.json".format(idx, specifier, work_path))
+        filename = "{2}/{0:d}/{1}.assembly.csv".format(idx, specifier, work_path)
+        print "Reading", filename
+        ag[idx] = pd.read_csv(filename)
 
     agp = pd.Panel(ag)
     agl = agp.transpose(items='minor', major='major', minor='items')\
@@ -678,8 +641,7 @@ def aggregator (work_path, specifier):
     agl = agl[agl.time_start.notnull()]
     agl.time_start = pd.to_datetime(agl.time_start, utc=True, unit='us')
     agl.time_end = pd.to_datetime(agl.time_end, utc=True, unit='us')
-    agl.set_index( 'time_start', inplace=True)
-    agl.sort_index( inplace=True)
+    agl.sort( columns=['time_start'], inplace=True)
     agl.fillna( 0, inplace=True)
 
     return agl
@@ -698,4 +660,55 @@ def resampled_pivot (dataframe, index, column, values, resample_spec, resample_h
         dataframe_cols[col_value] = series
 
     return pd.DataFrame(dataframe_cols).fillna(0)
+
+def get_log_blocks (specifier, work_path, machine):
+
+    base_path = work_path + '{0:d}/{1}'
+    logfile = base_path.format( machine, path_specifier)
+    block_table = base_path.format( machine, path_specifier) + ".assembly.csv"
+    table = pd.read_csv(block_table)
+
+    return (table, logfile)
+
+def data_time_slice (table, logfile, watch, start_time, end_time):
+
+    idx = bisect.bisect(table.index, start_time) - 1
+    block_start = table.iloc[idx]['block_start']
+    idx = bisect.bisect(table.index, end_time)
+    block_end = table.iloc[idx]['block_start']
+
+    chunks = []
+
+    with open(logfile) as log:
+        log.seek(block_start, 0)
+
+        for line in log:
+            if log.tell() >= block_end:
+                break
+
+            try:
+                watch.parse_log_line(line)
+            except KeyError:
+                chunks.append(watch.as_dataframe())
+                watch.clear()
+                watch.parse_log_line(line)
+
+    chunks.append(watch.as_dataframe())
+    assembly = pd.concat( chunks, ignore_index=True )
+
+    return assembly
+
+class LagFactory(object):
+
+    def __init__ (self, start=0):
+
+        self._store = start
+
+    def __call__ (self, value=None):
+
+        lag = self._store
+        if value:
+            self._store = value
+
+        return lag
 

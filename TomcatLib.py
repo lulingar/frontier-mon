@@ -576,7 +576,8 @@ def tomcat_aggregator (block_dataframe):
     end = int( tw_st.time_start.max())
 
     _s0 = tw_st.groupby(['servlet', 'state']).size().unstack()
-    _s1 = tw_st.groupby('servlet').agg({'threads_start': ['min', 'max'],
+    _s1 = tw_st.groupby(['servlet', 'finish_mode']).size().unstack()
+    _s2 = tw_st.groupby('servlet').agg({'threads_start': ['min', 'max'],
                                         'threads_stop': ['min', 'max'],
                                         'size': ['min', 'max', 'sum'],
                                         'error': 'count',
@@ -584,11 +585,10 @@ def tomcat_aggregator (block_dataframe):
                                         'msecs_acq': ['min', 'max', 'sum'],
                                         'msecs_finish': ['min', 'max', 'sum'],
                                         'msecs_stop': ['min', 'max', 'sum']})
-    _s2 = tw_st.groupby(['servlet', 'finish_mode']).size().unstack()
 
     _s0.columns = ["{0}_{1}".format(_s0.columns.name, col) for col in _s0.columns.values]
-    _s1.columns = map(str.strip, map('_'.join, _s1.columns.values))
-    _s2.columns = ["{0}_{1}".format(_s2.columns.name, col) for col in _s2.columns.values]
+    _s1.columns = ["{0}_{1}".format(_s1.columns.name, col) for col in _s1.columns.values]
+    _s2.columns = map(str.strip, map('_'.join, _s2.columns.values))
 
     df = _s0.join([_s1, _s2])
     df['time_start'] = start
