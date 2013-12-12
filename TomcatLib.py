@@ -294,7 +294,7 @@ class TomcatWatcher(LogStatistician):
                         return
 
                 # Default
-                if not any([msg in payload for msg in self.to_omit]):
+                if not any( msg in payload for msg in self.to_omit ):
                     update = {'other': payload}
                     self.data_D.modify (key, update)
                     print key, update
@@ -336,6 +336,173 @@ class TomcatWatcher(LogStatistician):
                   'finish_mode': finish_mode}
         self.data_D.modify( key, update)
 
+def parse_tomcat_timedate (timestamp_str):
+
+    #example: '09/07/13 00:01:32.208 CEST +0200'
+    date_, time_, tz_name, tz_off = timestamp_str.split()
+
+    try:
+        month, day, year = date_.split('/')
+        hour, minute, f_secs = time_.split(':')
+    except ValueError:
+        print "ts error:", timestamp_str
+
+    ofs_sign, ofs_h, ofs_m = tz_off[0], int(tz_off[1:3]), int(tz_off[3:])
+    ofs_sign = -1 if ofs_sign == '-' else 1
+    ofs_seconds = ofs_sign * 60 * (60*ofs_h + ofs_m)
+    offset = du.tz.tzoffset( tz_name, ofs_seconds)
+
+    second, sec_float = f_secs.split('.')
+    split_sec = float('0.' + sec_float)
+
+    return datetime( 2000+int(year), int(month), int(day),
+                     int(hour), int(minute), int(second),
+                     int(1e6*split_sec), tzinfo=offset )
+
+
+epoch_origin = datetime.utcfromtimestamp(0).replace(tzinfo=du.tz.tzutc())
+
+def parse_utc_time_usecs (timestamp_str):
+
+            key = servlet + id_raw
+
+            payload = record.pop('payload')
+
+            match = regex_start.match(payload)
+            if match:
+                record.update (match.groupdict())
+                record['time_start'] = timestamp
+                record['threads_start'] = int(record['threads_start'])
+                record['state'] = status_queued
+                record['keepalives'] = 0
+
+                complement = record.pop('complement')
+                parts = complement.split(':')
+                record['fid'] = parts[0].replace(' x-forwarded-for', '')\
+                                        .replace(' via', '')
+                if len(parts) > 1:
+                    if parts[-2].endswith(' x-forwarded-for'):
+                        record['forward'] = parts[-1]
+                    record['via'] = ':'.join(parts[1:-1]).replace('x-forwarded-for', '')
+
+                new = True
+                return record, key, new
+
+            match = self.regex_dbacq.match(payload)
+            if match:
+                update = match.groupdict()
+                update['active_acq'] = int(update['active_acq'])
+                update['msecs_acq'] = int(update['msecs_acq'])
+                return update, key, new
+
+            match = self.regex_dbfin.match(payload)
+            if match:
+                update = match.groupdict()
+                update['msecs_finish'] = int(update['msecs_finish'])
+                return update, key, new
+
+            match = self.regex_rowssize.match(payload)
+            if match:
+                update = match.groupdict()
+                update['rows'] = int(update['rows'])
+                update['size'] = int(update['size'])
+                return update, key, new
+
+            match = self.regex_threads.match(payload)
+            if match:
+                update = match.groupdict()
+                update['msecs_stop'] = int(update['msecs_stop'])
+                update['threads_stop'] = int(update['threads_stop'])
+                update.update( finish_record( key, timestamp, finish_normal))
+                return update, key, new
+
+            match = self.regex_sql.match(payload)
+            if match:
+                update = match.groupdict()
+                return update, key, new
+
+            match = self.regex_acq.match(payload)
+            if match:
+                update = match.groupdict()
+                return update, key, new
+
+            match = self.regex_exe.match(payload)
+            if match:
+                update = {'state': self.status_exec}
+                return update, key, new
+
+            match = self.regex_prc.match(payload)
+            if match:
+                update = {'state': self.status_precom}
+                return update, key, new
+
+            match = self.regex_busy.match(payload)
+            if match:
+                update = {'state': self.status_reject_busy}
+                return update, key, new
+
+            match = self.regex_kaacq.match(payload)
+            if match:
+                record = self.data_D[key]
+                update = {'keepalives': int(match.group('kaacq'))}
+                self.data_D.modify (key, update)
+                return
+
+            match = self.regex_error.match(payload)
+            if match:
+                update = match.groupdict()
+                self.data_D.modify (key, update)
+                return
+
+            match = self.regex_client.match(payload)
+            if match:
+                record = self.data_D[key]
+                if 'client' in record:
+                    update = match.groupdict()
+                    print 'Existing client message for id %s: %s' % (key, record['client'])
+                    print 'New error:', match.group('client')
+                #self.data_D.modify (key, update)
+                return
+
+            for regex_, code_ in self.ims_update:
+                match = regex_.match(payload)
+                if match:
+                    update = {'if-modified-since': code_}
+                    self.data_D.modify (key, update)
+                    return
+
+            # Default
+            if not any([msg in payload for msg in self.to_omit]):
+                update = {'other': payload}
+                self.data_D.modify (key, update)
+                print key, update
+                return
+
+        else:
+            key = servlet + '_-1'
+            match = self.regex_init.match(content)
+            if match:
+                if key not in self.data_D:
+                    record['time_start'] = timestamp
+                    record['finish_mode'] = self.finish_error
+                    self.data_D[key] = record
+                    self.history_H.append (key)
+                return
+
+    else:
+        if 'xception' in line:
+            if self._last_key:
+                key = self._last_key
+                timestamp = self._last_timestamp
+            else:
+                return
+
+            self.finish_record (key, timestamp, self.finish_error)
+
+        elif line.startswith('at '):
+            return
+        else:
+            print "Unforeseen line:", line
 def parse_tomcat_timedate (timestamp_str):
 
     #example: '09/07/13 00:01:32.208 CEST +0200'
@@ -412,173 +579,6 @@ def sort_blocks (timestamps_lib, base_path, block_path ):
         by_first = [ e[0] for e in sorted(timestamps_lib[machine].items(), key=lambda e: e[1][0]) ]
         by_last = [ e[0] for e in sorted(timestamps_lib[machine].items(), key=lambda e: e[1][1]) ]
         print machine, by_first == by_last
-
-        if by_first == by_last:
-
-            for old in by_first:
-                source = base_path.format(machine) + old
-                shutil.move(source, source + '.in')
-
-            for new, old in enumerate(by_first):
-                source = base_path.format(machine) + old + '.in'
-                target = block_path.format(machine, new)
-                shutil.move(source, target)
-
-            new_ts = {}
-            for new, old in enumerate(by_first):
-                new_ts[new] = timestamps_lib[machine][old]
-            timestamps_lib[machine] = new_ts
-
-class BlockRecord(object):
-
-    def __init__ (self, work_path, specifier, savefile):
-
-        self.base_path = work_path + '{0:d}/' + specifier + '/'
-        self.block_path = self.base_path + '{1:03d}'
-        self.save_file = savefile
-
-    def load (self):
-
-        with open(self.save_file) as fd:
-            timestamps_lib = json.load(fd)
-
-        tables_first = {}
-        tables_last = {}
-        for machine, table in timestamps_lib.items():
-            first, last = zip(*sorted(table.values()))
-            tables_first[int(machine)] = np.array( map( parse_tomcat_timedate, first))
-            tables_last[int(machine)] = np.array( map( parse_tomcat_timedate, last))
-
-        self.tables_s = tables_first
-        self.tables_e = tables_last
-
-    def get_block (self, timestamp, machine):
-
-        if isinstance(timestamp, str):
-            _ts = parse_tomcat_timedate(timestamp)
-        elif isinstance(timestamp, datetime):
-            _ts = timestamp
-        elif isinstance(timestamp, int):
-            _ts = datetime.fromtimestamp(timestamp*1e-6, du.tz.tzutc())
-
-        tables_s = self.tables_s[machine]
-        tables_e = self.tables_e[machine]
-
-        if tables_s[0] <= _ts < tables_e[-1]:
-            idx = tables_s.searchsorted(_ts)
-            return idx
-
-        raise ValueError("Out of range {1}".format(str(_ts)))
-
-    def get_file (self, block, machine):
-
-        if 0 <= block < len(self.tables_s[machine]):
-            return self.block_path.format(machine, block)
-        raise IndexError
-
-class TomcatView(object):
-
-    def __init__ (self, work_path, specifier, block_map_file, window_length_secs):
-
-        self.blocks = BlockRecord(work_path, specifier, block_map_file)
-        self.blocks.load()
-
-        self.watch = TomcatWatcher(window_length_secs, True)
-
-        self.window_length = timedelta(seconds=window_length_secs)
-        self.start = None
-        self.end = None
-
-    def set_start (self, dt_start, move_end=True):
-
-        if isinstance(dt_start, datetime):
-            self.start = dt_start
-        elif isinstance(dt_start, timedelta):
-            self.start += dt_start
-
-        if self.end and not move_end:
-            self.window_length = self.end - self.start
-        else:
-            self.end = self.start + self.window_length
-        self._update_spec()
-
-    def set_end (self, dt_end, move_start=True):
-
-        if isinstance(dt_end, datetime):
-            self.end = dt_end
-        elif isinstance(dt_end, timedelta):
-            self.end += dt_end
-
-        if self.start and not move_start:
-            self.window_length = self.end - self.start
-        else:
-            self.start = self.end - self.window_length
-        self._update_spec()
-
-    def set_window (self, window_length_secs, move_start=True):
-        if isinstance(window_length_secs, timedelta):
-            self.window_length = window_length_secs
-        else:
-            self.window_length = timedelta(seconds=window_length_secs)
-        if move_start:
-            self.set_end(self.end)
-        else:
-            self.set_start(self.start)
-        self._update_spec()
-
-    def get_dataframe (self):
-
-        return self.watch.as_dataframe()
-
-    def load_data (self, machine):
-
-        # For the time being
-        self.watch.clear()
-
-        oldest = self.watch.oldest_timestamp
-        newest = self.watch.newest_timestamp
-
-        if oldest is None or self._start_u < oldest:
-            start_reading = self._start_u
-        else:
-            start_reading = oldest + 1
-
-        if newest is None or self._end_u > newest:
-            stop_reading = self._end_u
-        else:
-            stop_reading = newest + 1
-
-        start_block = self.blocks.get_block(start_reading, machine)
-        end_block = self.blocks.get_block(stop_reading, machine)
-        for block in range(start_block, end_block+1):
-            filename = self.blocks.get_file( block, machine)
-            readline = get_lines_between_timestamps( filename, start_reading,
-                                                               stop_reading )
-            for line in readline:
-                self.watch.parse_log_line(line)
-
-        watch_length = self.watch.current_window_length_secs()
-        remaining = watch_length - self.window_length.seconds
-        self.watch.drop_oldest(remaining)
-
-        return True
-
-    def _update_spec (self):
-        self._start_u = int( 1e6 * (self.start - epoch_origin).total_seconds() )
-        self._end_u = int( 1e6 * (self.end - epoch_origin).total_seconds() )
-
-
-def tomcat_aggregator (block_dataframe):
-
-    tw_st = block_dataframe
-
-    start = int( tw_st.time_start.min())
-    end = int( tw_st.time_start.max())
-
-    _s0 = tw_st.groupby(['servlet', 'state']).size().unstack()
-    _s1 = tw_st.groupby(['servlet', 'finish_mode']).size().unstack()
-    _s2 = tw_st.groupby('servlet').agg({'threads_start': ['min', 'max'],
-                                        'threads_stop': ['min', 'max'],
                                         'size': ['min', 'max', 'sum'],
                                         'error': 'count',
                                         'duration': ['min', 'max', 'sum'],
