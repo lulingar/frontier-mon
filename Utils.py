@@ -1,5 +1,6 @@
 import base64
 import bisect
+import calendar
 import copy
 import collections
 import functools
@@ -13,6 +14,8 @@ import sys
 import time
 import zlib
 
+import dateutil as du
+import dateutil.parser as du_parser
 import numpy as np
 import numpy.ma as ma
 import pandas as pd
@@ -22,6 +25,7 @@ from glob import glob
 from heapq import nsmallest
 from operator import itemgetter
 from string import maketrans
+from datetime import datetime, timedelta
 
 from tacit import tac
 
@@ -212,7 +216,9 @@ class LogStatistician(object):
 
     def as_dataframe (self):
 
-        df = pd.DataFrame(self.data_D.get_raw_values(), columns=list(self.data_D.column_table))
+        df = pd.DataFrame( self.data_D.get_raw_values(),
+                           columns = list(self.data_D.column_table) )
+
         for col, mapping in self.data_D.hash_table.iteritems():
             df[col] = df[col].map( lambda e: mapping(int(e)),
                                    na_action = 'ignore')
@@ -451,20 +457,29 @@ class RecordTable(object):
             self.data_table[index, var_index] = value
 
     def remove (self, key):
+
         assert key in self.index_table, "key %s does not exist in table" % str(key)
         index = self.index_table[key]
         self.index_table.remove_by_index(index)
-        self.data_table[index,:] = ma.masked
+
+        # Numpy >= 1.8 prevents assignment of ma.masked (whose dtype=float)
+        #  to a masked array of a different dtype
+        #self.data_table[index,:] = ma.masked
 
     def clear (self, full=False):
+
+        # Numpy >= 1.8 prevents assignment of ma.masked (whose dtype=float)
+        #  to a masked array of a different dtype
+        #self.data_table.fill(ma.masked)
+
         self.index_table.clear()
-        self.data_table.fill(ma.masked)
         if full:
             self.column_table.clear()
             self.hash_table.clear()
             self._populate_indices()
 
     def pop (self, key):
+
         record = self.render_record(key)
         self.remove(key)
         return record
@@ -547,10 +562,11 @@ def iternamedtuples (dataframe):
     for row in dataframe.itertuples():
         yield Row(*row[1:])
 
-def gather_stats (machine, time_span, watch, path_specifier, work_path,
-                  processing_f, ts_getter, ts_parser, max_in_core=400e3):
+def gather_stats (machine, time_span, watch, log_file,
+                  processing_f, ts_getter, ts_parser, ts_locator,
+                  max_in_core=400e3):
 
-    def close_bin (chunks, watch, machine, block_start, processing_f):
+    def close_bin (chunks, watch, block_start, processing_f):
 
         chunks.append(watch.as_dataframe())
         aggregation = processing_f( pd.concat( chunks))
@@ -559,8 +575,6 @@ def gather_stats (machine, time_span, watch, path_specifier, work_path,
 
         return pickled
 
-    base_path = work_path + '{0:d}/{1}'
-    logfile = base_path.format( machine, path_specifier)
     start, end, time_bin = time_span
     time_bin_secs = time_bin.total_seconds()
 
@@ -571,9 +585,13 @@ def gather_stats (machine, time_span, watch, path_specifier, work_path,
     previous_line_index = LagFactory(0)
     watch.clear()
 
-    log_size = os.path.getsize(logfile)
+    log_size = os.path.getsize(log_file)
+    _, start_offset = ts_locator(log_file, start, minutes_tol=0.5)
 
-    with open(logfile) as log:
+    with open(log_file) as log:
+
+        log.seek(start_offset, 0)
+
         for line in log:
             previous_line_index(log.tell())
 
@@ -606,43 +624,31 @@ def gather_stats (machine, time_span, watch, path_specifier, work_path,
             in_core = len(watch)
             if collected_time > time_bin_secs or in_core > max_in_core:
 
-                print "{0}: +{1:f} ({2:.2f} %)".format(machine, collected_time, 100*float(log.tell())/log_size)
-                dframes.append( close_bin( chunks, watch, machine, block_start, processing_f))
+                progress = (ts - start).total_seconds() / (end - start).total_seconds()
+                print "{0}: +{1:f} secs. ({2:.2f} %)".format(machine, collected_time, 100*progress)
+                dframes.append( close_bin( chunks, watch, block_start, processing_f))
                 new_bin = True
                 watch.clear()
                 del chunks[:]
 
     if not first_chunk:
-        dframes.append( close_bin( chunks, watch, machine, block_start, processing_f))
+        dframes.append( close_bin( chunks, watch, block_start, processing_f))
 
     if dframes:
-        assembly = pd.concat( (pd.DataFrame(frame, columns=frame[0]._fields) for frame in dframes), ignore_index=True )
+        assembly = pd.concat( (pd.DataFrame(frame, columns=frame[0]._fields) for frame in dframes),
+                              axis=0, ignore_index=True, verify_integrity=False )
+        return assembly
 
-        save_file = base_path.format( machine, path_specifier) + ".assembly.csv"
-        assembly.to_csv(save_file, index=False)
-        print "File {0} written.".format(save_file)
+    return None
 
-    return
+def aggregator (dict_of_frames, column_name):
 
-def aggregator (work_path, specifier):
-
-    ag = {}
-    for idx in (1, 2, 3):
-        filename = "{2}/{0:d}/{1}.assembly.csv".format(idx, specifier, work_path)
-        print "Reading", filename
-        ag[idx] = pd.read_csv(filename)
-
-    agp = pd.Panel(ag)
+    agp = pd.Panel(dict_of_frames)
     agl = agp.transpose(items='minor', major='major', minor='items')\
-                        .to_frame(filter_observations=False)\
-                        .reset_index(level=1)
-    agl.rename( columns={'minor':'machine'}, inplace=True)
+             .to_frame(filter_observations=False)\
+             .reset_index(level=1)
+    agl.rename( columns={'minor': column_name}, inplace=True)
     agl.index.names = ['']
-    agl = agl[agl.time_start.notnull()]
-    agl.time_start = pd.to_datetime(agl.time_start, utc=True, unit='us')
-    agl.time_end = pd.to_datetime(agl.time_end, utc=True, unit='us')
-    agl.sort( columns=['time_start'], inplace=True)
-    agl.fillna( 0, inplace=True)
 
     return agl
 
@@ -664,13 +670,13 @@ def resampled_pivot (dataframe, index, column, values, resample_spec, resample_h
 def get_log_blocks (specifier, work_path, machine):
 
     base_path = work_path + '{0:d}/{1}'
-    logfile = base_path.format( machine, path_specifier)
+    log_file = base_path.format( machine, path_specifier)
     block_table = base_path.format( machine, path_specifier) + ".assembly.csv"
     table = pd.read_csv(block_table)
 
-    return (table, logfile)
+    return (table, log_file)
 
-def data_time_slice (table, logfile, watch, start_time, end_time):
+def data_time_slice (table, log_file, watch, start_time, end_time):
 
     idx = bisect.bisect(table.index, start_time) - 1
     block_start = table.iloc[idx]['block_start']
@@ -679,7 +685,7 @@ def data_time_slice (table, logfile, watch, start_time, end_time):
 
     chunks = []
 
-    with open(logfile) as log:
+    with open(log_file) as log:
         log.seek(block_start, 0)
 
         for line in log:
@@ -697,6 +703,101 @@ def data_time_slice (table, logfile, watch, start_time, end_time):
     assembly = pd.concat( chunks, ignore_index=True )
 
     return assembly
+
+def simple_datetime_entry (datetime_str):
+
+    local_zone = du.tz.tzlocal()
+    dto = du_parser.parse(datetime_str)
+
+    if dto.tzinfo is None:
+        dto = dto.replace(tzinfo=local_zone)
+
+    return dto.astimezone(local_zone)
+
+def mark_failover (df, host_ip_field, geo):
+
+    localhost_addr = '127.0.0.1'
+
+    df['IsSquid'] = df[host_ip_field].isin(geo['Ip'])
+    df['IsDirect'] = False
+    df['ThroughSquids'] = False
+    df['Origin'] = ''
+
+    squids = set(geo.Ip.values.tolist())
+    squids.discard(localhost_addr)
+
+    mark = lambda entry: mark_failover_from_fwd(entry, squids)
+    local = ( df[host_ip_field] == localhost_addr )
+
+    df['IsDirect'][local], df['ThroughSquids'][local], df['Origin'][local] = zip(*df['fwd'][local].map(mark))
+
+    df['Origin'][~local] = df[host_ip_field][~local]
+    df['IsDirect'][~local] = True
+    df['ThroughSquids'][~local] = df[host_ip_field][~local].isin(geo['Ip'])
+
+def mark_failover_from_fwd (ip_list, squid_set):
+
+    ips = ip_list.split(', ')
+    index = range(len(ips))
+
+    is_squid = [ ip in squid_set for ip in ips ]
+    through_squids = any(is_squid)
+    is_direct = (len(ips) == 1)
+
+    if len(ips) > 1:
+        origin_path = [ ips[idx] for idx in index if not is_squid[idx] ]
+        origin_path.extend( ips[idx] for idx in index if is_squid[idx] )
+    else:
+        origin_path = ips
+
+    return is_direct, through_squids, origin_path[0]
+
+def find_file_offset_generic (find_valid_offset_function, log_file, target_datetime, minutes_tol=1, hint_start=0):
+
+    # target_datetime is naive, interpreted here as UTC
+    assert isinstance(target_datetime, datetime) or\
+           isinstance(target_datetime, int)
+
+    log = open(log_file, 'rb')
+
+    start = hint_start
+    log.seek(0, 2)
+    end = log.tell()
+
+    if isinstance(target_datetime, datetime):
+        target_epoch = datetime_to_UTC_epoch(target_datetime)
+    else:
+        target_epoch = target_datetime
+
+    # Designed for logs that record 24 hours of activity
+    tolerance = 60.0 * minutes_tol
+    iterations_left = int(np.ceil(np.log2(24*3600/tolerance)))
+
+    valid_found = False
+    while not valid_found and iterations_left:
+
+        pointer = (start + end)/2
+        timestamp_epoch, offset = find_valid_offset_function(log, pointer)
+        error = target_epoch - timestamp_epoch
+
+        valid_found = ( abs(error) <= tolerance )
+        if error < 0:
+            end = offset
+        else:
+            start = offset
+
+        iterations_left -= 1
+
+    log.close()
+
+    if valid_found:
+        return timestamp_epoch, offset
+    else:
+        return -1, -1
+
+def datetime_to_UTC_epoch (dt):
+
+    return calendar.timegm( dt.utctimetuple())
 
 class LagFactory(object):
 

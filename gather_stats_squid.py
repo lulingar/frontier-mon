@@ -43,7 +43,19 @@ def main ():
     for p in processes:
         p.join()
 
-    agg = Utils.aggregator(work_path, specifier)
+    ag = {}
+    for idx in (1, 2, 3):
+        filename = "{2}/{0:d}/{1}.assembly.csv".format(idx, specifier, work_path)
+        print "Reading", filename
+        ag[idx] = pd.read_csv(filename)
+
+    agg = Utils.aggregator(ag, "machine")
+    agg = agg[agg.time_start.notnull()]
+    agg.time_start = pd.to_datetime(agg.time_start, utc=True, unit='us')
+    agg.time_end = pd.to_datetime(agg.time_end, utc=True, unit='us')
+    agg.sort( columns=['time_start'], inplace=True)
+    agg.fillna( 0, inplace=True)
+
     csv_file = work_path + 'squid_aggregation.csv'
     agg.to_csv(csv_file, index=False)
     print "File {0} written.".format(csv_file)
