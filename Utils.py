@@ -1,10 +1,8 @@
 import base64
 import bisect
 import calendar
-import copy
 import collections
 import functools
-import gzip
 import itertools
 import json
 import operator
@@ -21,16 +19,18 @@ import numpy.ma as ma
 import pandas as pd
 pd.options.display.max_columns = 40
 
-from glob import glob
 from heapq import nsmallest
 from operator import itemgetter
 from string import maketrans
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from tacit import tac
 
+def current_utc_time_secs():
+    return int(time.time())
+
 def current_utc_time_usecs():
-    return int (1e6 * time.time())
+    return int(1e6 * time.time())
 
 def lru_cache (maxsize=128):
     '''Least-recently-used cache decorator.
@@ -575,7 +575,10 @@ def gather_stats (machine, time_span, watch, log_file,
 
         return pickled
 
+    utc_zone = du.tz.tzutc()
     start, end, time_bin = time_span
+    start = start.astimezone(utc_zone).replace(tzinfo=None)
+    end = end.astimezone(utc_zone).replace(tzinfo=None)
     time_bin_secs = time_bin.total_seconds()
 
     dframes = []
@@ -777,9 +780,14 @@ def find_file_offset_generic (find_valid_offset_function, log_file, target_datet
     while not valid_found and iterations_left:
 
         pointer = (start + end)/2
-        timestamp_epoch, offset = find_valid_offset_function(log, pointer)
-        error = target_epoch - timestamp_epoch
 
+        try:
+            timestamp_epoch, offset = find_valid_offset_function(log, pointer)
+        except ValueError, e:
+            sys.stdout.write(str(e) + '\n')
+            break
+
+        error = target_epoch - timestamp_epoch
         valid_found = ( abs(error) <= tolerance )
         if error < 0:
             end = offset

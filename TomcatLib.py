@@ -1,19 +1,12 @@
-import json
 import re
-import shutil
 import sys
 
-import dateutil as du
-import numpy as np
-import pandas as pd
-
 from datetime import datetime, timedelta
-from glob import glob
 
 import Utils
 from Utils import (LogStatistician, current_utc_time_usecs,
                    decode_frontier, get_hostname,
-                   find_file_offset_generic)
+                   find_file_offset_generic, datetime_to_UTC_epoch)
 
 """
  Tomcat's access.log format is:
@@ -65,8 +58,12 @@ class TomcatWatcher(LogStatistician):
                         "fwd": str,
                         "via": str,
                         "finish_mode": str,
-                        "if-modified-since": str,
+                        "if_modified_since": str,
                         "other": str,
+                        "cli_ver": str,
+                        "pid": str,
+                        "userid": str,
+                        "userinfo": str,
                         "threads_start": int,
                         "threads_stop": int,
                         "msecs_acq": int,
@@ -330,18 +327,37 @@ class TomcatWatcher(LogStatistician):
 
     def process_id_info (self, info_str):
 
-        fis = self.regex_id_fields.findall(info_str)
+        expected = set(('frontier-id', 'via', 'x-forwarded-for'))
+        gotten = set(self.regex_id_fields.findall(info_str))
+        valid = list( expected & gotten )
 
-        str_indexes = [ info_str.index(fi) for fi in fis ]
-        ini_indexes = [ str_indexes[ix] + len(field) + 2 for ix, field in enumerate(fis) ] # len(": ") = 2
-        end_indexes = str_indexes[1:]
+        str_indexes = [ info_str.index(fi) for fi in valid ]
+        str_indexes, valid = zip(*sorted(zip(str_indexes, valid)))
+
+        ini_indexes = [ str_indexes[ix] + len(field + ": ") for ix, field in enumerate(valid) ]
+        end_indexes = list(str_indexes[1:])
         end_indexes.append(len(info_str))
 
         fields = {}
-        for idx_field, name in enumerate(fis):
+        for idx_field, name in enumerate(valid):
             start = ini_indexes[idx_field]
             end = end_indexes[idx_field]
-            fields[self.id_fields_map[name]] = info_str[start:end].rstrip()
+            fields[name] = info_str[start:end].rstrip()
+
+        if 'frontier-id' in fields:
+            fid_fields = fields['frontier-id'].split(' ', 4)
+            if len(fid_fields) == 5:
+                client_id, client_ver, pid, uid, uinfo = fid_fields
+                fields['frontier-id'] = client_id
+                fields['cli_ver'] = client_ver
+                fields['pid'] = pid
+                fields['userid'] = uid
+                fields['userinfo'] = uinfo
+
+        for name in fields:
+            if name in self.id_fields_map:
+                datum = fields.pop(name)
+                fields[self.id_fields_map[name]] = datum
 
         return fields
 
@@ -364,32 +380,40 @@ def parse_tomcat_timedate (timestamp_str):
         hour, minute, f_secs = time_.split(':')
 
         ofs_sign, ofs_h, ofs_m = tz_off[0], int(tz_off[1:3]), int(tz_off[3:])
-        ofs_sign = -1 if ofs_sign == '-' else 1
+
+        if ofs_sign == '-':
+            ofs_sign = 1
+        else:
+            ofs_sign = -1
         ofs_seconds = ofs_sign * 60 * (60*ofs_h + ofs_m)
-        offset = du.tz.tzoffset( tz_name, ofs_seconds)
+        offset = timedelta(seconds=ofs_seconds)
 
         second, sec_float = f_secs.split('.')
         split_sec = float('0.' + sec_float)
 
-        return datetime( 2000+int(year), int(month), int(day),
-                        int(hour), int(minute), int(second),
-                        int(1e6*split_sec), tzinfo=offset )
+        naive = datetime( 2000+int(year), int(month), int(day),
+                         int(hour), int(minute), int(second),
+                         int(1e6*split_sec) )
 
-    except ValueError:
-        print ">>> TS error:", timestamp_str
+        return naive + offset
+
+    except ValueError, ex:
+        console.exception(">>> TS error:" + timestamp_str)
         return None
-
-epoch_origin = datetime.utcfromtimestamp(0).replace(tzinfo=du.tz.tzutc())
 
 def parse_utc_time_secs (timestamp_str):
 
     timestamp = parse_tomcat_timedate( timestamp_str)
-    return int( (timestamp - epoch_origin).total_seconds() )
+    epoch = datetime_to_UTC_epoch(timestamp)
+
+    return epoch
 
 def parse_utc_time_usecs (timestamp_str):
 
     timestamp = parse_tomcat_timedate( timestamp_str)
-    return int( 1e6 * (timestamp - epoch_origin).total_seconds() )
+    epoch = datetime_to_UTC_epoch(timestamp)
+
+    return int(1e6)*epoch + timestamp.microsecond
 
 def get_timestamp (line):
     match = regex_line.match(line)
@@ -417,17 +441,25 @@ def get_lines_between_timestamps (file_name, start_ts, end_ts):
             if generate:
                 yield line
 
-def get_valid_from_binary_offset (log_obj, offset):
+def get_valid_from_binary_offset (log_obj, offset_start):
 
-    log_obj.seek(offset, 0)
+    log_obj.seek(0, 2)
+    file_size = log_obj.tell()
+
+    log_obj.seek(offset_start, 0)
 
     timestamp = None
+    last_offset = -1
     while not timestamp:
         offset = log_obj.tell()
         timestamp = get_timestamp(log_obj.readline())
-    # It was necessary to use readline() instead of next(),
-    #  as the offset reported by tell() was altered by
-    #  Python's internal line buffering when using next()
+        # It was necessary to use readline() instead of next(),
+        #  as the offset reported by tell() was altered by
+        #  Python's internal line buffering when using next()
+
+        if last_offset == offset:
+            raise ValueError("Stuck at byte %d (and file size is %d). Search stopped.\n" % (offset, file_size))
+        last_offset = offset
 
     return parse_utc_time_secs(timestamp), offset
 

@@ -6,7 +6,6 @@ import sys
 import pandas as pd
 
 from datetime import datetime, timedelta
-import dateutil
 import TomcatLib
 import Utils
 
@@ -16,6 +15,7 @@ def main ():
     if specifier is None:
         return 1
 
+    print "Range:", start, "to", end
     tic = datetime.now()
 
     generate_assemblies(specifier, work_path, start, end, time_bin)

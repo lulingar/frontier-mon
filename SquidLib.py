@@ -1,17 +1,17 @@
 import bisect
 import json
-import os
 import random
 import re
 
 import dateutil as du
-import numpy as np
-import pandas as pd
 
 from datetime import datetime, timedelta
 from glob import glob
 
-from Utils import LogStatistician, current_utc_time_usecs, decode_frontier, get_hostname
+import Utils
+from Utils import (LogStatistician, current_utc_time_secs,
+                   decode_frontier, get_hostname,
+                   find_file_offset_generic, datetime_to_UTC_epoch)
 
 series = {0: "UDP?",
           1: "Info",
@@ -164,9 +164,9 @@ def parse_log_line (line, use_timestamps_in_log=True):
 
         timestamp_log = record.pop('timestamp')
         if use_timestamps_in_log:
-            timestamp = parse_utc_time_usecs( timestamp_log)
+            timestamp = parse_utc_time_secs( timestamp_log)
         else:
-            timestamp = current_utc_time_usecs()
+            timestamp = current_utc_time_secs()
         record['timestamp'] = timestamp
         record['if-modified-since'] = record.pop('IMS')
 
@@ -219,28 +219,39 @@ month_abbreviations = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
 
 def parse_squid_timedate (timestamp_str):
 
-    td, tz = timestamp_str.split()
+    try:
+        td, tz = timestamp_str.split()
 
-    day = int(td[0:2])
-    month = month_abbreviations[td[3:6]]
-    year = int(td[7:11])
-    hour = int(td[12:14])
-    minute = int(td[15:17])
-    second = int(td[18:20])
+        day = int(td[0:2])
+        month = month_abbreviations[td[3:6]]
+        year = int(td[7:11])
+        hour = int(td[12:14])
+        minute = int(td[15:17])
+        second = int(td[18:20])
 
-    ofs_sign, ofs_h, ofs_m = tz[0], int(tz[1:3]), int(tz[3:])
-    ofs_sign = -1 if ofs_sign == '-' else 1
-    ofs_seconds = ofs_sign * 60 * (60*ofs_h + ofs_m)
-    offset = du.tz.tzoffset("SQD", ofs_seconds)
+        ofs_sign, ofs_h, ofs_m = tz[0], int(tz[1:3]), int(tz[3:])
 
-    return datetime(year, month, day, hour, minute, second, tzinfo=offset)
+        if ofs_sign == '-':
+            ofs_sign = 1
+        else:
+            ofs_sign = -1
+        ofs_seconds = ofs_sign * 60 * (60*ofs_h + ofs_m)
+        offset = timedelta(seconds=ofs_seconds)
 
-epoch_origin = datetime.utcfromtimestamp(0).replace(tzinfo=du.tz.tzutc())
+        naive = datetime(year, month, day, hour, minute, second)
 
-def parse_utc_time_usecs (timestamp_str):
+        return naive + offset
 
-    timestamp = parse_squid_timedate(timestamp_str)
-    return int( 1e6 * (timestamp - epoch_origin).total_seconds() )
+    except ValueError:
+        print ">>> TS error:", timestamp_str
+        return None
+
+def parse_utc_time_secs (timestamp_str):
+
+    timestamp = parse_squid_timedate( timestamp_str)
+    epoch = datetime_to_UTC_epoch(timestamp)
+
+    return epoch
 
 def get_timestamp (line):
     return line.split('[',1)[1].split(']',1)[0]
@@ -268,13 +279,40 @@ def get_lines_between_timestamps (file_name, start_ts, end_ts):
         for line in fd:
 
             timestamp_str = line.split('[',1)[1].split(']',1)[0]
-            timestamp = parse_utc_time_usecs(timestamp_str)
+            timestamp = parse_utc_time_secs(timestamp_str)
             generate = (start_ts <= timestamp < end_ts)
             if timestamp >= end_ts:
                 break
 
             if generate:
                 yield line
+
+def find_log_offset (log_file, target_datetime, minutes_tol=1, hint_start=0):
+
+    return find_file_offset_generic (get_valid_from_binary_offset, log_file,
+                                     target_datetime, minutes_tol, hint_start)
+
+def get_valid_from_binary_offset (log_obj, offset_start):
+
+    log_obj.seek(0, 2)
+    file_size = log_obj.tell()
+
+    log_obj.seek(offset_start, 0)
+
+    timestamp = None
+    last_offset = -1
+    while not timestamp:
+        offset = log_obj.tell()
+        timestamp = get_timestamp(log_obj.readline())
+        # It was necessary to use readline() instead of next(),
+        #  as the offset reported by tell() was altered by
+        #  Python's internal line buffering when using next()
+
+        if last_offset == offset:
+            raise ValueError("Stuck at byte %d (and file size is %d). Search stopped.\n" % (offset, file_size))
+        last_offset = offset
+
+    return parse_utc_time_secs(timestamp), offset
 
 class BlockRecord(object):
 
