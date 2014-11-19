@@ -8,10 +8,12 @@ import dateutil as du
 from datetime import datetime, timedelta
 from glob import glob
 
-import Utils
-from Utils import (LogStatistician, current_utc_time_secs,
+from SquidParse import (parse_log_line, parse_utc_time_secs,
+                        parse_squid_timedate)
+from Utils import (LogStatistician,
                    decode_frontier, get_hostname,
-                   find_file_offset_generic, datetime_to_UTC_epoch)
+                   find_file_offset_generic,
+                   get_first_timestamp_generic, get_last_timestamp_generic)
 
 series = {0: "UDP?",
           1: "Info",
@@ -73,32 +75,6 @@ codes = {100: "Continue",
          601: "roundcube: software configuration error",
          603: "roundcube: invalid authorization"}
 
-"""
- Squid's access.log format is:
-    >a ui un [{d/b/Y:H:M:S +0000}tl] "rm ru HTTP/rv" Hs <st Ss:Sh tr "{X-Frontier-Id}>h" "{If-Modified-Since}>h"
- Meanings are:
-    >a      Client source IP address
-    tl      Local time. Optional strftime format argument
-            default d/b/Y:H:M:S z
-    tr      Response time (milliseconds)
-    >h      Request header. Optional header name argument
-            on the format header[:[separator]element]
-    <h      Reply header. Optional header name argument
-            as for >h
-    un      User name
-    ui      User name from ident
-    ue      User name from external acl helper
-    Hs      HTTP status code
-    Ss      Squid request status (TCP_MISS etc)
-    Sh      Squid hierarchy status (DEFAULT_PARENT etc)
-    rm      Request method (GET/POST etc)
-    ru      Request URL
-    rv      Request protocol version
-    <st     Reply size including HTTP headers
-"""
-squid_access_re = re.compile(r"""^(?P<who>\S+) (?P<user_ident>\S+) (?P<user_name>\S+) \[(?P<timestamp>\S+ \S+)\] "(?P<method>\S+) (?P<url>\S+) HTTP/(?P<proto_version>\S+)" (?P<http_code>\d+) (?P<size>\d+) (?P<req_status>[^: ]+):(?P<hierarchy_status>\S+) (?P<duration>\d+) "(?P<frontier_id>[^"]+)" "(?P<IMS>[^"]*)"$""")
-squid_url_re = re.compile(r'[^/]+[/]+(?P<server>[^/:]+)[:]*[^/]*/(?P<data>\S+)')
-squid_data_re = re.compile(r'(?P<servlet>[^/]+)/(?P<query_name>[^/]+)[/?](?P<query>\S+)')
 class SquidWatcher(LogStatistician):
 
     record_variables = {'if-modified-since': str,
@@ -154,112 +130,20 @@ class SquidWatcher(LogStatistician):
 
         return
 
-
-def parse_log_line (line, use_timestamps_in_log=True):
-
-    match = squid_access_re.match(line)
-
-    if match:
-        record = match.groupdict()
-
-        timestamp_log = record.pop('timestamp')
-        if use_timestamps_in_log:
-            timestamp = parse_utc_time_secs( timestamp_log)
-        else:
-            timestamp = current_utc_time_secs()
-        record['timestamp'] = timestamp
-        record['if-modified-since'] = record.pop('IMS')
-
-        frontier_id = record.pop('frontier_id')
-
-        if 'opportunistic probe' in frontier_id:
-            record['fid_sw_release'] = frontier_id
-        else:
-            frontier_id_parts = frontier_id.split()
-
-            if len(frontier_id_parts) > 1:
-                record['fid_sw_release'] = frontier_id_parts[0]
-                record['fid_sw_version'] = frontier_id_parts[1]
-
-                if len(frontier_id_parts) > 2:
-                    if frontier_id_parts[0] != "SLS_probe":
-                        record['fid_pid'] = frontier_id_parts[2]
-                if len(frontier_id_parts) > 3:
-                    record['fid_uid'] = frontier_id_parts[3]
-                    record['fid_userdn'] = ' '.join(frontier_id_parts[4:])
-            else:
-                record['fid_sw_release'] = frontier_id_parts[0]
-
-        #record['who'] = get_hostname( record['who'])
-
-        url = record.pop('url')
-        url_match = squid_url_re.match(url)
-        if url_match:
-            record.update( url_match.groupdict())
-            data = record.pop('data')
-
-            data_match = squid_data_re.match(data)
-            if data_match:
-                record.update(data_match.groupdict())
-                #record['query'] = decode_frontier( record['query'])
-                return record
-        else:
-            data = '_empty_'
-
-        record['query'] = data
-        record['query_name'] = "_primitive_"
-        return record
-
-    print "No record",line
-    return None
-
-month_abbreviations = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
-                       'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8,
-                       'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
-
-def parse_squid_timedate (timestamp_str):
+def get_timestamp (line):
 
     try:
-        td, tz = timestamp_str.split()
-
-        day = int(td[0:2])
-        month = month_abbreviations[td[3:6]]
-        year = int(td[7:11])
-        hour = int(td[12:14])
-        minute = int(td[15:17])
-        second = int(td[18:20])
-
-        ofs_sign, ofs_h, ofs_m = tz[0], int(tz[1:3]), int(tz[3:])
-
-        if ofs_sign == '-':
-            ofs_sign = 1
-        else:
-            ofs_sign = -1
-        ofs_seconds = ofs_sign * 60 * (60*ofs_h + ofs_m)
-        offset = timedelta(seconds=ofs_seconds)
-
-        naive = datetime(year, month, day, hour, minute, second)
-
-        return naive + offset
-
-    except ValueError:
-        print ">>> TS error:", timestamp_str
+        timestamp_str = line.split('[',1)[1].split(']',1)[0]
+    except:
         return None
 
-def parse_utc_time_secs (timestamp_str):
+    return timestamp_str
 
-    timestamp = parse_squid_timedate( timestamp_str)
-    epoch = datetime_to_UTC_epoch(timestamp)
-
-    return epoch
-
-def get_timestamp (line):
-    return line.split('[',1)[1].split(']',1)[0]
-
-get_first_timestamp = lambda file_name: Utils.get_first_timestamp(file_name, get_timestamp)
-get_last_timestamp = lambda file_name: Utils.get_last_timestamp(file_name, get_timestamp)
+get_first_timestamp = lambda file_name: get_first_timestamp_generic(file_name, get_timestamp)
+get_last_timestamp = lambda file_name: get_last_timestamp_generic(file_name, get_timestamp)
 
 def get_timestamp_tables (base_path):
+
     tables_first_str = {}
     tables_last_str = {}
     for machine in (1, 2, 3):
@@ -278,7 +162,7 @@ def get_lines_between_timestamps (file_name, start_ts, end_ts):
     with open(file_name) as fd:
         for line in fd:
 
-            timestamp_str = line.split('[',1)[1].split(']',1)[0]
+            timestamp_str = get_timestamp(line)
             timestamp = parse_utc_time_secs(timestamp_str)
             generate = (start_ts <= timestamp < end_ts)
             if timestamp >= end_ts:
@@ -301,7 +185,7 @@ def get_valid_from_binary_offset (log_obj, offset_start):
 
     timestamp = None
     last_offset = -1
-    while not timestamp:
+    while timestamp is None:
         offset = log_obj.tell()
         timestamp = get_timestamp(log_obj.readline())
         # It was necessary to use readline() instead of next(),

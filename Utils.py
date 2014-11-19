@@ -1,16 +1,12 @@
-import base64
 import bisect
 import calendar
 import collections
-import functools
 import itertools
 import json
 import operator
 import os
-import socket
 import sys
 import time
-import zlib
 
 import dateutil as du
 import dateutil.parser as du_parser
@@ -19,9 +15,6 @@ import numpy.ma as ma
 import pandas as pd
 pd.options.display.max_columns = 40
 
-from heapq import nsmallest
-from operator import itemgetter
-from string import maketrans
 from datetime import datetime
 
 from tacit import tac
@@ -31,92 +24,6 @@ def current_utc_time_secs():
 
 def current_utc_time_usecs():
     return int(1e6 * time.time())
-
-def lru_cache (maxsize=128):
-    '''Least-recently-used cache decorator.
-
-    Arguments to the cached function must be hashable.
-    Cache performance statistics stored in f.hits and f.misses.
-    http://en.wikipedia.org/wiki/Cache_algorithms#Least_Recently_Used
-
-    '''
-    def decorating_function (user_function):
-        cache = collections.OrderedDict()    # order: least recent to most recent
-
-        @functools.wraps(user_function)
-        def wrapper(*args, **kwds):
-            key = args
-            if kwds:
-                key += tuple(sorted(kwds.items()))
-            try:
-                result = cache.pop(key)
-                wrapper.hits += 1
-
-            except KeyError:
-                result = user_function(*args, **kwds)
-                wrapper.misses += 1
-                if len(cache) >= maxsize:
-                    cache.popitem(0)    # purge least recently used cache entry
-
-            cache[key] = result         # record recent use of this key
-            return result
-
-        wrapper.hits = wrapper.misses = 0
-        return wrapper
-
-    return decorating_function
-
-def lfu_cache (maxsize=128):
-    '''Least-frequenty-used cache decorator.
-
-    Arguments to the cached function must be hashable.
-    Cache performance statistics stored in f.hits and f.misses.
-    Clear the cache with f.clear().
-    http://en.wikipedia.org/wiki/Least_Frequently_Used
-
-    '''
-    def decorating_function (user_function):
-        cache = {}                        # mapping of args to results
-        use_count = collections.Counter() # times each key has been accessed
-        kwarg_mark = object()             # separate positional and keyword args
-
-        @functools.wraps(user_function)
-        def wrapper (*args, **kwargs):
-            key = args
-            if kwargs:
-                key += (kwarg_mark,) + tuple(sorted(kwargs.items()))
-
-            # get cache entry or compute if not found
-            try:
-                result = cache[key]
-                use_count[key] += 1
-                wrapper.hits += 1
-
-            except KeyError:
-                # need to add something to the cache, make room if necessary
-                if len(cache) == maxsize:
-                    for k, _ in nsmallest(maxsize // 10 or 1,
-                                            use_count.iteritems(),
-                                            key=itemgetter(1)):
-                        del cache[k], use_count[k]
-                result = user_function(*args, **kwargs)
-                cache[key] = result
-                use_count[key] += 1
-                wrapper.misses += 1
-
-            return result
-
-        def clear():
-            cache.clear()
-            use_count.clear()
-            wrapper.hits = wrapper.misses = 0
-
-        wrapper.hits = wrapper.misses = 0
-        wrapper.clear = clear
-        wrapper.cache = cache
-        return wrapper
-
-    return decorating_function
 
 class TimeWindowedRecord(object):
 
@@ -226,38 +133,6 @@ class LogStatistician(object):
 
     def __len__(self):
         return len(self.history_H)
-
-@lfu_cache(maxsize=1024)
-def get_hostname (ip):
-
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except socket.herror:
-        return ip
-
-@lfu_cache(maxsize=1024)
-def decode_frontier (query):
-
-    char_translation = maketrans(".-_", "+/=")
-    url_parts = query.split ("encoding=BLOB")
-
-    if len(url_parts) > 1:
-
-        url = url_parts[1].split("&p1=", 1)
-        encparts = url[1].split("&", 1)
-        if len(encparts) > 1:
-            ttlpart = "&" + encparts[1]
-        else:
-            ttlpart = ""
-        encoded_query = encparts[0].translate(char_translation)
-        try:
-            decoded_query = zlib.decompress (base64.binascii.a2b_base64 (encoded_query)).strip()
-        except zlib.error:
-            decoded_query = encoded_query
-    else:
-        decoded_query = query
-
-    return decoded_query
 
 
 class IndexDict(object):
@@ -545,20 +420,25 @@ def is_strictly_increasing(lst):
     op = operator.lt
     return all(op(x, y) for x, y in itertools.izip(lst, lst[1:]))
 
-def get_first_timestamp (file_name, timestamp_fcn):
+def get_first_timestamp_generic (file_name, timestamp_fcn):
     for line in open(file_name):
         ts = timestamp_fcn(line)
         if ts:
             return ts
 
-def get_last_timestamp (file_name, timestamp_fcn):
+def get_last_timestamp_generic (file_name, timestamp_fcn):
     for line in tac(file_name):
         ts = timestamp_fcn(line)
         if ts:
             return ts
 
 def iternamedtuples (dataframe):
-    Row = collections.namedtuple('Row', dataframe.columns)
+    try:
+        Row = collections.namedtuple('Row', dataframe.columns)
+    except Exception, ex:
+        print ex
+        print dataframe.columns
+
     for row in dataframe.itertuples():
         yield Row(*row[1:])
 
@@ -590,6 +470,9 @@ def gather_stats (machine, time_span, watch, log_file,
 
     log_size = os.path.getsize(log_file)
     _, start_offset = ts_locator(log_file, start, minutes_tol=0.5)
+
+    if start_offset == -1:
+        raise ValueError("Starting time {0} was not found in file {1}".format(start, log_file))
 
     with open(log_file) as log:
 
@@ -644,16 +527,6 @@ def gather_stats (machine, time_span, watch, log_file,
 
     return None
 
-def aggregator (dict_of_frames, column_name):
-
-    agp = pd.Panel(dict_of_frames)
-    agl = agp.transpose(items='minor', major='major', minor='items')\
-             .to_frame(filter_observations=False)\
-             .reset_index(level=1)
-    agl.rename( columns={'minor': column_name}, inplace=True)
-    agl.index.names = ['']
-
-    return agl
 
 def resampled_pivot (dataframe, index, column, values, resample_spec, resample_how):
 

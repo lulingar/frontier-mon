@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 import multiprocessing as mp
 import os
 import sys
@@ -41,10 +42,12 @@ def parse_commandline():
 
 def generate_assemblies (specifier, work_path, start, end, time_bin):
 
+    machines = os.listdir(work_path)
+
     print "Generating assemblies..."
     processes = [ mp.Process(target = complete_tomcat_assemble,
                              args = (machine, start, end, time_bin, specifier, work_path))
-                 for machine in (1, 2, 3) ]
+                 for machine in machines ]
 
     print "Starting processes"
     [ p.start() for p in processes ]
@@ -59,24 +62,24 @@ def generate_assemblies (specifier, work_path, start, end, time_bin):
 
 def assemble (specifier, work_path, start, end):
 
+    contents = os.listdir(work_path)
+    machines = ( name for name in contents if os.path.isdir(os.path.join(work_path, name)) )
+
     print "Assembling data..."
-    ag = {}
-    for idx in (1, 2, 3):
+    ag = []
+    for idx in machines:
         filename = os.path.join(work_path, str(idx), specifier + ".assembly.csv")
         print "Reading", filename
-        ag[idx] = pd.read_csv(filename)
-        """
-        index, dataframe = tomcat_q.get()
-        print "Reading", index
-        ag[index] = dataframe
-        """
 
-    agg = Utils.aggregator(ag, "machine")
-    agg = agg[ agg.time_start.notnull() ]
-    agg.time_start = pd.to_datetime(agg.time_start, utc=True, unit='us')
-    agg.time_end = pd.to_datetime(agg.time_end, utc=True, unit='us')
+        df = pd.read_csv(filename, index_col=None)
+        df["machine"] = idx
+        ag.append(df)
+
+    agg = pd.concat(ag)
+    # It saves space to leave the timestamps as epoch numbers
+    #agg.time_start = pd.to_datetime( agg.time_start, utc=True, unit='us')
+    #agg.time_end = pd.to_datetime( agg.time_end, utc=True, unit='us')
     agg.sort( columns=['time_start'], inplace=True)
-    agg.fillna( 0, inplace=True)
 
     csv_file = os.path.join(work_path, 'tomcat_aggregation.csv')
     agg.to_csv(csv_file, index=False)
@@ -99,7 +102,7 @@ def complete_tomcat_assemble (machine, start, end, time_bin, specifier, work_pat
 
 def query_aggregator (block_dataframe):
 
-    group_fields = ['servlet', 'sql', 'fid', 'who', 'fwd']
+    group_fields = ['servlet', 'sql', 'fid', 'who', 'fwd', 'userinfo', 'cli_ver']
     tw_st = block_dataframe
 
     start = int( tw_st.time_start.min())
@@ -111,7 +114,7 @@ def query_aggregator (block_dataframe):
                                            'threads_stop': 'max',
                                            'size': 'sum',
                                            'error': 'count',
-                                           'duration': ['min', 'max', 'sum'],
+                                           'duration': ['min', 'max', 'mean'],
                                            'msecs_acq': 'sum',
                                            'msecs_finish': 'sum',
                                            'msecs_stop': 'sum'})

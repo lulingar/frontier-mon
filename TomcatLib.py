@@ -3,10 +3,10 @@ import sys
 
 from datetime import datetime, timedelta
 
-import Utils
 from Utils import (LogStatistician, current_utc_time_usecs,
                    decode_frontier, get_hostname,
-                   find_file_offset_generic, datetime_to_UTC_epoch)
+                   find_file_offset_generic, datetime_to_UTC_epoch,
+                   get_first_timestamp_generic, get_last_timestamp_generic)
 
 """
  Tomcat's access.log format is:
@@ -288,7 +288,7 @@ class TomcatWatcher(LogStatistician):
                 for regex_, code_ in self.ims_update:
                     match = regex_.match(payload)
                     if match:
-                        update = {'if-modified-since': code_}
+                        update = {'if_modified_since': code_}
                         self.data_D.modify (key, update)
                         return
 
@@ -353,6 +353,12 @@ class TomcatWatcher(LogStatistician):
                 fields['pid'] = pid
                 fields['userid'] = uid
                 fields['userinfo'] = uinfo
+            else:
+                fields['frontier-id'] = fields['frontier-id']
+                fields['cli_ver'] = '-'
+                fields['pid'] = '-'
+                fields['userid'] = '-'
+                fields['userinfo'] = '-'
 
         for name in fields:
             if name in self.id_fields_map:
@@ -397,7 +403,7 @@ def parse_tomcat_timedate (timestamp_str):
 
         return naive + offset
 
-    except ValueError, ex:
+    except Exception, ex:
         console.exception(">>> TS error:" + timestamp_str)
         return None
 
@@ -422,8 +428,8 @@ def get_timestamp (line):
     else:
         return None
 
-get_first_timestamp = lambda file_name: Utils.get_first_timestamp(file_name, get_timestamp)
-get_last_timestamp = lambda file_name: Utils.get_last_timestamp(file_name, get_timestamp)
+get_first_timestamp = lambda file_name: get_first_timestamp_generic(file_name, get_timestamp)
+get_last_timestamp = lambda file_name: get_last_timestamp_generic(file_name, get_timestamp)
 
 def get_lines_between_timestamps (file_name, start_ts, end_ts):
 
@@ -559,35 +565,6 @@ class TomcatView(object):
         self._start_u = int( 1e6 * (self.start - epoch_origin).total_seconds() )
         self._end_u = int( 1e6 * (self.end - epoch_origin).total_seconds() )
 
-
-def tomcat_aggregator (block_dataframe):
-
-    tw_st = block_dataframe
-
-    start = int( tw_st.time_start.min())
-    end = int( tw_st.time_start.max())
-
-    _s0 = tw_st.groupby(['servlet', 'state']).size().unstack()
-    _s1 = tw_st.groupby(['servlet', 'finish_mode']).size().unstack()
-    _s2 = tw_st.groupby('servlet').agg({'threads_start': ['min', 'max'],
-                                        'threads_stop': ['min', 'max'],
-                                        'size': ['min', 'max', 'sum'],
-                                        'error': 'count',
-                                        'duration': ['min', 'max', 'sum'],
-                                        'msecs_acq': ['min', 'max', 'sum'],
-                                        'msecs_finish': ['min', 'max', 'sum'],
-                                        'msecs_stop': ['min', 'max', 'sum']})
-
-    _s0.columns = ["{0}_{1}".format(_s0.columns.name, col) for col in _s0.columns.values]
-    _s1.columns = ["{0}_{1}".format(_s1.columns.name, col) for col in _s1.columns.values]
-    _s2.columns = map(str.strip, map('_'.join, _s2.columns.values))
-
-    df = _s0.join([_s1, _s2])
-    df['time_start'] = start
-    df['time_end'] = end
-    df['span'] = (end - start)/1e6
-
-    return df.reset_index()
 
 def render_queries (dataframe):
 
